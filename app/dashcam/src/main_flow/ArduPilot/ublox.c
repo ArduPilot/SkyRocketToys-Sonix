@@ -16,6 +16,7 @@
 #include <web_server.h>
 #include "util/print_vprintf.h"
 #include <libmid_nvram/snx_mid_nvram.h>
+#include "record/rec_schedule.h"
 
 #define LEAPSECS_SINCE_1980 0x80
 
@@ -1125,10 +1126,25 @@ void ublox_assist_task_process(void *pvParameters)
             continue;
         }
 
-        if (get_sys_seconds_utc() < UBLOX_MIN_DATE &&
-            mga_pos_estimate.utc_time > UBLOX_MIN_DATE) {
-            console_printf("setting time to %u\n", mga_pos_estimate.utc_time);
-            set_date_utc(mga_pos_estimate.utc_time);
+        /*
+          Set our clock from the best time we have.  The time saved
+          with the last GPS position is only a guess, so when the
+          flight controller or the app gives us a real time, set the
+          clock again - but not while recording video, so as not to
+          move the clock under a file being written.
+         */
+        static uint8_t clock_source = TIME_SOURCE_NONE;
+        if (mga_pos_estimate.utc_time > UBLOX_MIN_DATE &&
+            (get_sys_seconds_utc() < UBLOX_MIN_DATE ||
+             (time_source > clock_source && schedrec_state() != 1))) {
+            // utc_time is the time at time_base, which may have been a
+            // while ago if we waited for a recording to finish
+            const uint32_t utc_now = mga_pos_estimate.utc_time +
+                (get_sys_seconds_boot() - mga_pos_estimate.time_base);
+            console_printf("setting time to %u (source %u)\n",
+                           (unsigned)utc_now, (unsigned)time_source);
+            set_date_utc(utc_now);
+            clock_source = time_source;
         }
 
         // save GPS lock every 30 seconds when we have lock
