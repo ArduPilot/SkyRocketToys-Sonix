@@ -34,6 +34,9 @@
 #include "util/print_vprintf.h"
 #include "video_main.h"
 #include <../sensor_cap/sensor_capability.h>
+#include "../utility/utility.h"
+#include "../errno.h"
+#include <libmid_isp/snx_mid_isp.h>
 #include <libmid_automount/automount.h>
 #include "snapshot.h"
 
@@ -369,6 +372,14 @@ static void send_named_int(const char *name, int32_t value)
 #define CAMERA_COMPONENT_ID MAV_COMP_ID_CAMERA
 #define CAMERA_RTSP_URI "rtsp://192.168.99.1:554/" LIVE_PREVIEW_STREAM_NAME
 
+/*
+  The camera definition file (APWeb's files/data/camera.xml) lists our
+  settings.  Ground stations cache it by vendor, model and version, so
+  bump the version whenever the file changes.
+ */
+#define CAMERA_DEFINITION_URI "http://192.168.99.1/data/camera.xml"
+#define CAMERA_DEFINITION_VERSION 3
+
 static int camera_udp_sock = -1;
 static mavlink_status_t camera_status; // our own sequence numbers
 static int32_t camera_image_count;     // photos taken since boot
@@ -441,7 +452,8 @@ static void camera_send_information(void)
     info.resolution_v = height;
     strncpy((char *)info.vendor_name, "SkyRocket", sizeof(info.vendor_name));
     strncpy((char *)info.model_name, "SkyViper", sizeof(info.model_name));
-    // no cam_definition_uri: QGC stalls if it can't fetch one
+    info.cam_definition_version = CAMERA_DEFINITION_VERSION;
+    strncpy(info.cam_definition_uri, CAMERA_DEFINITION_URI, sizeof(info.cam_definition_uri));
 
     mavlink_message_t msg;
     mavlink_msg_camera_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
@@ -580,6 +592,171 @@ static void camera_send_ack(const mavlink_message_t *request, uint16_t command, 
                                         0, 0, // progress, result_param2
                                         request->sysid, request->compid);
     camera_send(&msg);
+}
+
+/*
+  Camera settings, by the names used in the camera definition file.
+  WDR is changed the same way as from the phone app, so it's saved and
+  the two stay in step.
+ */
+static int camera_get_wdr(int *value)
+{
+    if (snx_nvram_integer_get(NVRAM_PKG_VIDEO_ISP, NVRAM_CFG_VIDEO_WDR, value) != NVRAM_SUCCESS) {
+        *value = 1; // factory setting
+    }
+    return OK;
+}
+
+/*
+  The image filters aren't saved: they go back to the factory tuning
+  (the defaults here) when the camera restarts.  Ranges are what was
+  measured on the camera: the library accepts values outside them, but
+  brightness, contrast and saturation stop changing at the top, and
+  negative contrast turns the picture grey.
+ */
+static const struct camera_param {
+    const char *name;      // at most 15 characters, for PARAM_EXT
+    uint8_t type;          // MAV_PARAM_EXT_TYPE_UINT8 (switches) or _INT32
+    int32_t min, max;      // as in the camera definition file
+    int32_t default_value; // restored by RESET_CAMERA_SETTINGS
+    int (*get)(int *value);
+    int (*set)(int value);
+} camera_params[] = {
+    { "CAM_WDR",        MAV_PARAM_EXT_TYPE_UINT8, 0, 1,   1,  camera_get_wdr,                app_uti_set_video_wdr },
+    { "CAM_BRIGHTNESS", MAV_PARAM_EXT_TYPE_INT32, 0, 127, 64, snx_isp_filter_brightness_get, snx_isp_filter_brightness_set },
+    { "CAM_CONTRAST",   MAV_PARAM_EXT_TYPE_INT32, 0, 64,  32, snx_isp_filter_contrast_get,   snx_isp_filter_contrast_set },
+    { "CAM_SATURATION", MAV_PARAM_EXT_TYPE_INT32, 0, 127, 64, snx_isp_filter_saturation_get, snx_isp_filter_saturation_set },
+};
+#define CAMERA_NUM_PARAMS (sizeof(camera_params)/sizeof(camera_params[0]))
+
+static int32_t camera_param_get(const struct camera_param *p)
+{
+    int value = 0;
+    if (p->get(&value) != OK) {
+        console_printf("camera: can't read %s\n", p->name);
+        return 0;
+    }
+    return value;
+}
+
+static const struct camera_param *camera_param_find(const char *id, int16_t index)
+{
+    if (index >= 0) {
+        return (unsigned)index < CAMERA_NUM_PARAMS ? &camera_params[index] : NULL;
+    }
+    unsigned i;
+    for (i = 0; i < CAMERA_NUM_PARAMS; i++) {
+        // param_id is not NUL-terminated when all 16 characters are used
+        if (strncmp(id, camera_params[i].name, 16) == 0) {
+            return &camera_params[i];
+        }
+    }
+    return NULL;
+}
+
+// PARAM_EXT values are little-endian at the start of the field
+static void camera_param_encode(char *buf, const struct camera_param *p, int32_t value)
+{
+    memset(buf, 0, MAVLINK_MSG_PARAM_EXT_VALUE_FIELD_PARAM_VALUE_LEN);
+    if (p->type == MAV_PARAM_EXT_TYPE_UINT8) {
+        buf[0] = (uint8_t)value;
+    } else {
+        memcpy(buf, &value, sizeof(value));
+    }
+}
+
+static int32_t camera_param_decode(const char *buf, const struct camera_param *p)
+{
+    if (p->type == MAV_PARAM_EXT_TYPE_UINT8) {
+        return (uint8_t)buf[0];
+    }
+    int32_t value;
+    memcpy(&value, buf, sizeof(value));
+    return value;
+}
+
+static void camera_send_param(const struct camera_param *p)
+{
+    char value[MAVLINK_MSG_PARAM_EXT_VALUE_FIELD_PARAM_VALUE_LEN];
+    camera_param_encode(value, p, camera_param_get(p));
+    mavlink_message_t msg;
+    mavlink_msg_param_ext_value_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+                                            p->name, value, p->type,
+                                            CAMERA_NUM_PARAMS, p - camera_params);
+    camera_send(&msg);
+}
+
+/*
+  PARAM_EXT_SET: apply it, and ACK with the value now in force, which
+  QGC shows in its settings panel
+ */
+static void camera_handle_param_set(const mavlink_message_t *msg)
+{
+    mavlink_param_ext_set_t set;
+    mavlink_msg_param_ext_set_decode(msg, &set);
+    if (set.target_system != fc_sysid || set.target_component != CAMERA_COMPONENT_ID) {
+        return;
+    }
+    const struct camera_param *p = camera_param_find(set.param_id, -1);
+    if (p == NULL) {
+        return; // not one of ours; leave the GCS to time out
+    }
+
+    uint8_t result;
+    const int32_t v = camera_param_decode(set.param_value, p);
+    if (set.param_type != p->type || v < p->min || v > p->max) {
+        result = PARAM_ACK_VALUE_UNSUPPORTED;
+    } else if (p->set(v) != OK) {
+        result = PARAM_ACK_FAILED;
+    } else {
+        result = PARAM_ACK_ACCEPTED;
+    }
+
+    char value[MAVLINK_MSG_PARAM_EXT_ACK_FIELD_PARAM_VALUE_LEN];
+    camera_param_encode(value, p, camera_param_get(p));
+    mavlink_message_t ack;
+    mavlink_msg_param_ext_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &ack,
+                                          p->name, value, p->type, result);
+    camera_send(&ack);
+}
+
+static void camera_handle_param_read(const mavlink_message_t *msg)
+{
+    mavlink_param_ext_request_read_t req;
+    mavlink_msg_param_ext_request_read_decode(msg, &req);
+    if (req.target_system != fc_sysid || req.target_component != CAMERA_COMPONENT_ID) {
+        return;
+    }
+    const struct camera_param *p = camera_param_find(req.param_id, req.param_index);
+    if (p != NULL) {
+        camera_send_param(p);
+    }
+}
+
+static void camera_handle_param_list(const mavlink_message_t *msg)
+{
+    mavlink_param_ext_request_list_t req;
+    mavlink_msg_param_ext_request_list_decode(msg, &req);
+    if (req.target_system != fc_sysid || req.target_component != CAMERA_COMPONENT_ID) {
+        return;
+    }
+    unsigned i;
+    for (i = 0; i < CAMERA_NUM_PARAMS; i++) {
+        camera_send_param(&camera_params[i]);
+    }
+}
+
+// back to defaults
+static uint8_t camera_reset_settings(void)
+{
+    uint8_t result = MAV_RESULT_ACCEPTED;
+    unsigned i;
+    for (i = 0; i < CAMERA_NUM_PARAMS; i++) {
+        if (camera_params[i].set(camera_params[i].default_value) != OK) {
+            result = MAV_RESULT_FAILED;
+        }
+    }
+    return result;
 }
 
 /*
@@ -774,6 +951,11 @@ static void camera_handle_command(const mavlink_message_t *msg)
         result = camera_take_photo(msg, &c);
         send_after_ack = MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS;
         break;
+    case MAV_CMD_RESET_CAMERA_SETTINGS:
+        // never UNSUPPORTED: that leaves QGC's capture buttons locked
+        result = camera_reset_settings();
+        break;
+
     case MAV_CMD_IMAGE_STOP_CAPTURE:
         // nothing runs on after a single shot
         result = MAV_RESULT_ACCEPTED;
@@ -858,8 +1040,19 @@ static bool camera_udp_input(const uint8_t *buf, ssize_t len)
             continue;
         }
         for_camera = true;
-        if (msg.msgid == MAVLINK_MSG_ID_COMMAND_LONG) {
+        switch (msg.msgid) {
+        case MAVLINK_MSG_ID_COMMAND_LONG:
             camera_handle_command(&msg);
+            break;
+        case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_LIST:
+            camera_handle_param_list(&msg);
+            break;
+        case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_READ:
+            camera_handle_param_read(&msg);
+            break;
+        case MAVLINK_MSG_ID_PARAM_EXT_SET:
+            camera_handle_param_set(&msg);
+            break;
         }
     }
     // only whole messages, all for us; anything else goes on as it was
