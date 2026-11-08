@@ -8,8 +8,7 @@ Building
 
 To build the firmware follow these steps
 - cd buildscript
-- git submodule init
-- git submodule update
+- git submodule update --init --recursive
 - make oldconfig
 - make clean
 - make mavlink
