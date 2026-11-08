@@ -775,8 +775,13 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
 	mavlink_command_ack_t m;
 	mavlink_msg_command_ack_decode(msg, &m);
         command_ack_save(&m);
-        // whether a command is supported is a property of the flight
-        // controller firmware, so it doesn't matter who sent it
+        // only the flight controller's own ACKs tell us what its
+        // firmware supports; ignore ACKs from other components
+        if (msg->sysid != MAVLINK_TARGET_SYSTEM_ID ||
+            msg->compid != MAV_COMP_ID_AUTOPILOT1) {
+            break;
+        }
+        // which GCS asked doesn't matter
         if (m.command == MAV_CMD_REQUEST_MESSAGE) {
             if (m.result == MAV_RESULT_ACCEPTED) {
                 request_message_accepted = true;
