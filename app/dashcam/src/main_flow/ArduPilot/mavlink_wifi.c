@@ -33,6 +33,7 @@
 #include <libmid_nvram/snx_mid_nvram.h>
 #include "util/print_vprintf.h"
 #include "video_main.h"
+#include <../sensor_cap/sensor_capability.h>
 #include <libmid_automount/automount.h>
 #include "snapshot.h"
 
@@ -79,6 +80,7 @@ static struct telem_nav_data nav_data;
 static struct mga_position gps_pos;
 
 static uint32_t last_heartbeat_ms;
+static uint8_t fc_sysid; // from the flight controller's HEARTBEAT; 0 until we hear one
 static uint32_t last_attitude_ms;
 static uint32_t last_autopilot_version_ms;
 
@@ -339,6 +341,75 @@ static void send_named_int(const char *name, int32_t value)
         // also send to real FC so TX can get the info
         mavlink_msg_named_value_int_send(MAVLINK_COMM_RC, get_sys_seconds_boot()*1000, name, value);
     }
+}
+
+/*
+  Advertise the video as a MAVLink camera component on WiFi so ground
+  stations can find it.  QGroundControl wants a HEARTBEAT from a
+  camera component of the vehicle's system, then CAMERA_INFORMATION
+  saying it has a video stream, then VIDEO_STREAM_INFORMATION.  It
+  uses the last two whether or not it asked for them, so rather than
+  answering requests (which would mean parsing what the GCS sends us)
+  we just broadcast them once a second.
+ */
+#define CAMERA_COMPONENT_ID MAV_COMP_ID_CAMERA
+#define CAMERA_RTSP_URI "rtsp://192.168.99.1:554/" LIVE_PREVIEW_STREAM_NAME
+
+static void camera_periodic(int udp_sock)
+{
+    static mavlink_status_t camera_status; // our own sequence numbers
+    static uint32_t last_camera_ms;
+    uint32_t now = get_time_boot_ms();
+
+    // only while there's a vehicle for the camera to be part of
+    if (fc_sysid == 0 || now - last_heartbeat_ms > 3000) {
+        return;
+    }
+    if (now - last_camera_ms < 1000) {
+        return;
+    }
+    last_camera_ms = now;
+
+    mavlink_message_t msg;
+    mavlink_msg_heartbeat_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+                                      MAV_TYPE_CAMERA, MAV_AUTOPILOT_INVALID,
+                                      0, 0, MAV_STATE_ACTIVE);
+    send_mavlink_wifi(udp_sock, &msg);
+
+    unsigned width = 0, height = 0, fps = 0;
+    if (mf_video_resmap_get_preview_params(&width, &height, &fps, NULL, NULL) < 0) {
+        width = height = fps = 0;
+    }
+
+    mavlink_camera_information_t info;
+    memset(&info, 0, sizeof(info));
+    info.time_boot_ms = now;
+    info.focal_length = NAN;
+    info.sensor_size_h = NAN;
+    info.sensor_size_v = NAN;
+    info.flags = CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
+    info.resolution_h = width;
+    info.resolution_v = height;
+    strncpy((char *)info.vendor_name, "SkyRocket", sizeof(info.vendor_name));
+    strncpy((char *)info.model_name, "SkyViper", sizeof(info.model_name));
+    // no cam_definition_uri: QGC stalls if it can't fetch one
+    mavlink_msg_camera_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+                                                 &msg, &info);
+    send_mavlink_wifi(udp_sock, &msg);
+
+    // QGC ignores later copies for a stream it already knows, so the
+    // URI must not change
+    mavlink_msg_video_stream_information_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+                                                     1, 1, // stream 1 of 1
+                                                     VIDEO_STREAM_TYPE_RTSP,
+                                                     VIDEO_STREAM_STATUS_FLAGS_RUNNING,
+                                                     fps, width, height,
+                                                     0, 0, 0, // bitrate, rotation, hfov unknown
+                                                     "SkyViper", CAMERA_RTSP_URI,
+                                                     VIDEO_STREAM_ENCODING_H264,
+                                                     0, // a MAVLink camera, not one attached to the autopilot
+                                                     0); // vfov unknown
+    send_mavlink_wifi(udp_sock, &msg);
 }
 
 /*
@@ -733,6 +804,9 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
 
 	mavlink_heartbeat_t m;
 	mavlink_msg_heartbeat_decode(msg, &m);
+        if (msg->compid == MAV_COMP_ID_AUTOPILOT1 && m.autopilot != MAV_AUTOPILOT_INVALID) {
+            fc_sysid = msg->sysid;
+        }
         bool armed = m.base_mode & MAV_MODE_FLAG_SAFETY_ARMED;
         if (m.autopilot == MAV_AUTOPILOT_ARDUPILOTMEGA) {
             switch (m.custom_mode) {
@@ -1340,6 +1414,7 @@ static void mavlink_main(void *pvParameters, int udp_sock)
 	mavlink_check_baudrate();
 	tx_upload_periodic();
         check_video_recording_end();
+        camera_periodic(udp_sock);
     }
 }
 
