@@ -52,6 +52,19 @@ static int thumbnail_ongoing = 0;		/**<  record picture is on processing or not 
 //static int thumbnail_is_full = 0;		/**<  space for saving picture is full or not*/
 
 long long snapshot_free_space = 0;		/**<  remaind space for picture(byte unit)*/
+
+/*
+  pictures saved, and pictures given to us that weren't, so that
+  callers can find out whether theirs made it to the card
+ */
+static volatile unsigned int snapshot_given_count = 0;
+static volatile unsigned int snapshot_saved_count = 0;
+static volatile unsigned int snapshot_failed_count = 0;
+// bumped when mf_snapshot_uninit counts the outstanding pictures failed
+static volatile unsigned int snapshot_settle_count = 0;
+
+// the video callback and the save task both count failures
+#define SNAPSHOT_COUNT(count) do { taskENTER_CRITICAL(); (count)++; taskEXIT_CRITICAL(); } while (0)
 long long thumbnail_free_space = 0;		/**<  remaind space for picture(byte unit)*/
 
 //static xTimerHandle SmalSnapshoTimer = NULL;
@@ -278,6 +291,11 @@ int mf_snapshot_uninit(void)
 	mf_video_set_snapshot_cb(NULL);
 	vTaskDelete(snapshot_info.task_save_pic);
 	vQueueDelete(snapshot_info.queue_pic);
+	// pictures still waiting to be written never will be
+	taskENTER_CRITICAL();
+	snapshot_failed_count = snapshot_given_count - snapshot_saved_count;
+	snapshot_settle_count++;
+	taskEXIT_CRITICAL();
 #if defined(CONFIG_SYSTEM_PLATFORM_SN98660) || defined(CONFIG_SYSTEM_PLATFORM_SN98661) || defined(CONFIG_SYSTEM_PLATFORM_SN98671) || defined (CONFIG_SYSTEM_PLATFORM_SN98293)
 	rec_filelist_clear(T_SNAPSHOT);
 #endif
@@ -366,6 +384,7 @@ static void task_save_pic(void *pvParameters)
 					if ((ret = f_open(&pic_file, pic_info.picname, FA_WRITE | FA_CREATE_ALWAYS)) != FR_OK) {
 						PIC_PRINT(SYS_ERR, "open file fail(ret = %d)\n", ret);
 						snapshot_ongoing = 0;
+						SNAPSHOT_COUNT(snapshot_failed_count);
 						if(pic_info.dev==REC_DEV_USBH)
 							vPortFree(pic_info.OriginAddr);
 						else
@@ -378,6 +397,7 @@ static void task_save_pic(void *pvParameters)
 					if ((ret = f_write(&pic_file, pic_info.addr, pic_info.size, &uiWritedSize)) != FR_OK) {
 						PIC_PRINT(SYS_ERR, "write file fail(ret = %d)\n", ret);
 						snapshot_ongoing = 0;
+						SNAPSHOT_COUNT(snapshot_failed_count);
 						if(pic_info.dev==REC_DEV_USBH)
 							vPortFree(pic_info.OriginAddr);
 						else
@@ -388,17 +408,28 @@ static void task_save_pic(void *pvParameters)
 						continue;
 					}
 
-					f_close(&pic_file);
+					// a short write, or a failed close, leaves an incomplete file
+					const int written = (uiWritedSize == pic_info.size);
+					if ((ret = f_close(&pic_file)) != FR_OK || !written) {
+						PIC_PRINT(SYS_ERR, "picture not saved (close ret = %d, wrote %u of %u)\n",
+						          ret, uiWritedSize, pic_info.size);
+					}
 #if defined(CONFIG_SYSTEM_PLATFORM_SN98660) || defined(CONFIG_SYSTEM_PLATFORM_SN98661) || defined(CONFIG_SYSTEM_PLATFORM_SN98671) || defined (CONFIG_SYSTEM_PLATFORM_SN98293)
 					rec_filenode_add(rec_recordtype_get(pic_info.type), pic_info.picname, NULL);			
 #endif
 					snapshot_ongoing = 0;
 					snapshot_free_space -= pic_info.size;
+					if (ret == FR_OK && written)
+						SNAPSHOT_COUNT(snapshot_saved_count);
+					else
+						SNAPSHOT_COUNT(snapshot_failed_count);
 				} else {
 					snapshot_is_full = 1;
+					SNAPSHOT_COUNT(snapshot_failed_count);
 					PIC_PRINT(SYS_WARN, "pic folder is full\n");
 				}
 			} else {
+				SNAPSHOT_COUNT(snapshot_failed_count);
 				if ((get_sd_umount_err() == 1) && (first_insert == 1)) {
 #if defined(CONFIG_SYSTEM_PLATFORM_SN98660) || defined(CONFIG_SYSTEM_PLATFORM_SN98661) || defined(CONFIG_SYSTEM_PLATFORM_SN98671) || defined (CONFIG_SYSTEM_PLATFORM_SN98293)
 					rec_filelist_clear(rec_recordtype_get(pic_info.type));
@@ -495,6 +526,11 @@ end:
 void mf_snapshot_get_pic(unsigned char *pPic, unsigned int size, const char *name, enum RECORDKIND type)
 {
 	pic_info_t pic_info;
+	unsigned int settle_count;
+	taskENTER_CRITICAL();
+	snapshot_given_count++;
+	settle_count = snapshot_settle_count;
+	taskEXIT_CRITICAL();
 	if(f_get_drv()==REC_DEV_USBH){
 		pic_info.OriginAddr = pvPortMalloc(size+0x1ff, GFP_KERNEL, MODULE_APP);
 		pic_info.addr = ((unsigned int)pic_info.OriginAddr+0x1ff) & ~0x1ff;
@@ -507,6 +543,12 @@ void mf_snapshot_get_pic(unsigned char *pPic, unsigned int size, const char *nam
 	PIC_PRINT(SYS_INFO, "mf_snapshot_get_pic-Malloc size=%d\n", size);
 	if (!pic_info.addr) {
 		PIC_PRINT(SYS_ERR, "picture buffer allocate fail (size = %d)\n", size);
+		taskENTER_CRITICAL();
+		// unless mf_snapshot_uninit has already counted it failed
+		if (settle_count == snapshot_settle_count) {
+			snapshot_failed_count++;
+		}
+		taskEXIT_CRITICAL();
 		return;
 	}
 	
@@ -562,6 +604,21 @@ int mf_snapshot_status(void)
 		}
 		return 0;
 	}
+}
+
+/**
+ * @brief interface function - how many pictures have been saved, how
+ * many given to us couldn't be, and how many are still to be written.
+ * Unlike mf_snapshot_status(), pending covers a picture the save task
+ * has taken from its queue but not yet started on.
+ */
+void mf_snapshot_get_results(unsigned int *saved, unsigned int *failed, unsigned int *pending)
+{
+	taskENTER_CRITICAL();
+	*saved = snapshot_saved_count;
+	*failed = snapshot_failed_count;
+	*pending = snapshot_given_count - *saved - *failed;
+	taskEXIT_CRITICAL();
 }
 
 int mf_snapshot_get_queue_num(void)
