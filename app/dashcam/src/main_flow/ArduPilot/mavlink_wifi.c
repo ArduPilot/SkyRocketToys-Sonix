@@ -222,8 +222,13 @@ void mavlink_rc_write(const uint8_t *buf, uint32_t len)
 /*
   process a UDP packet
  */
+static bool camera_udp_input(const uint8_t *buf, ssize_t len);
+
 static void process_udp_packet(uint8_t *buf, ssize_t len)
 {
+    if (camera_udp_input(buf, len)) {
+        return;
+    }
     mavlink_fc_write(buf, len);
     stats.recv_pkts++;
     stats.recv_bytes += len;
@@ -344,61 +349,114 @@ static void send_named_int(const char *name, int32_t value)
 }
 
 /*
-  Advertise the video as a MAVLink camera component on WiFi so ground
-  stations can find it.  QGroundControl wants a HEARTBEAT from a
-  camera component of the vehicle's system, then CAMERA_INFORMATION
-  saying it has a video stream, then VIDEO_STREAM_INFORMATION.  It
-  uses the last two whether or not it asked for them, so rather than
-  answering requests (which would mean parsing what the GCS sends us)
-  we just broadcast them once a second.
+  A MAVLink camera component on WiFi, so ground stations can find the
+  video and use the camera.
+
+  QGroundControl wants a HEARTBEAT from a camera component of the
+  vehicle's system, then CAMERA_INFORMATION, then
+  VIDEO_STREAM_INFORMATION; it uses the last two whether or not it
+  asked for them, so we broadcast all three once a second.  We also
+  answer the camera commands the GCS sends us: still capture, video
+  recording, and requests for the camera messages.
+
+  Our own broadcasts are never passed on to the flight controller, so
+  it doesn't learn about the camera component and route its traffic
+  onto other links.  Without that route it would act on messages for
+  the camera itself, so packets holding nothing but messages for the
+  camera aren't passed on either; everything else from the GCS goes
+  to the flight controller untouched, and we only look at a copy.
  */
 #define CAMERA_COMPONENT_ID MAV_COMP_ID_CAMERA
 #define CAMERA_RTSP_URI "rtsp://192.168.99.1:554/" LIVE_PREVIEW_STREAM_NAME
 
-static void camera_periodic(int udp_sock)
+static int camera_udp_sock = -1;
+static mavlink_status_t camera_status; // our own sequence numbers
+static int32_t camera_image_count;     // photos taken since boot
+
+/*
+  Photos asked for while the previous one is still being saved are
+  queued rather than refused.  A photo is reported as captured once
+  the snapshot code has written it to the card, or failed to.
+ */
+#define CAMERA_MAX_QUEUED_PHOTOS 3
+#define CAMERA_PHOTO_TIMEOUT_MS 10000
+static uint8_t camera_photos_queued;
+// the last photo queued with a capture sequence number (param4)
+static uint32_t camera_capture_seq;
+static uint8_t camera_capture_sysid, camera_capture_compid;
+static uint32_t camera_capture_ms;
+static bool camera_photo_in_progress;
+static uint32_t camera_photo_start_ms;
+static unsigned camera_photo_saved_before, camera_photo_failed_before;
+static bool camera_queue_blocked;      // waiting on a snapshot started elsewhere
+static uint32_t camera_queue_blocked_ms;
+static float camera_free_mib;          // refreshed every few seconds
+
+// a video started from here, the phone app or the transmitter
+static bool camera_video_on;
+static uint32_t camera_video_start_ms;
+static uint32_t camera_own_packets;    // our broadcasts heard back, and dropped
+
+// where the vehicle is, for CAMERA_IMAGE_CAPTURED
+static mavlink_global_position_int_t camera_position;
+
+static void camera_send(mavlink_message_t *msg)
 {
-    static mavlink_status_t camera_status; // our own sequence numbers
-    static uint32_t last_camera_ms;
-    uint32_t now = get_time_boot_ms();
-
-    // only while there's a vehicle for the camera to be part of
-    if (fc_sysid == 0 || now - last_heartbeat_ms > 3000) {
-        return;
+    if (camera_udp_sock != -1) {
+        send_mavlink_wifi(camera_udp_sock, msg);
     }
-    if (now - last_camera_ms < 1000) {
-        return;
-    }
-    last_camera_ms = now;
+}
 
+static void camera_send_heartbeat(void)
+{
     mavlink_message_t msg;
     mavlink_msg_heartbeat_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
                                       MAV_TYPE_CAMERA, MAV_AUTOPILOT_INVALID,
                                       0, 0, MAV_STATE_ACTIVE);
-    send_mavlink_wifi(udp_sock, &msg);
+    camera_send(&msg);
+}
 
-    unsigned width = 0, height = 0, fps = 0;
-    if (mf_video_resmap_get_preview_params(&width, &height, &fps, NULL, NULL) < 0) {
-        width = height = fps = 0;
+static void camera_preview_params(unsigned *width, unsigned *height, unsigned *fps)
+{
+    if (mf_video_resmap_get_preview_params(width, height, fps, NULL, NULL) < 0) {
+        *width = *height = *fps = 0;
     }
+}
+
+static void camera_send_information(void)
+{
+    unsigned width, height, fps;
+    camera_preview_params(&width, &height, &fps);
 
     mavlink_camera_information_t info;
     memset(&info, 0, sizeof(info));
-    info.time_boot_ms = now;
+    info.time_boot_ms = get_time_boot_ms();
     info.focal_length = NAN;
     info.sensor_size_h = NAN;
     info.sensor_size_v = NAN;
-    info.flags = CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
+    info.flags = CAMERA_CAP_FLAGS_CAPTURE_VIDEO |
+                 CAMERA_CAP_FLAGS_CAPTURE_IMAGE |
+                 CAMERA_CAP_FLAGS_HAS_VIDEO_STREAM;
     info.resolution_h = width;
     info.resolution_v = height;
     strncpy((char *)info.vendor_name, "SkyRocket", sizeof(info.vendor_name));
     strncpy((char *)info.model_name, "SkyViper", sizeof(info.model_name));
     // no cam_definition_uri: QGC stalls if it can't fetch one
+
+    mavlink_message_t msg;
     mavlink_msg_camera_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
                                                  &msg, &info);
-    send_mavlink_wifi(udp_sock, &msg);
+    camera_send(&msg);
+}
+
+static void camera_send_stream_information(void)
+{
+    unsigned width, height, fps;
+    camera_preview_params(&width, &height, &fps);
 
     // QGC ignores later copies for a stream it already knows, so the
     // URI must not change
+    mavlink_message_t msg;
     mavlink_msg_video_stream_information_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
                                                      1, 1, // stream 1 of 1
                                                      VIDEO_STREAM_TYPE_RTSP,
@@ -409,7 +467,435 @@ static void camera_periodic(int udp_sock)
                                                      VIDEO_STREAM_ENCODING_H264,
                                                      0, // a MAVLink camera, not one attached to the autopilot
                                                      0); // vfov unknown
-    send_mavlink_wifi(udp_sock, &msg);
+    camera_send(&msg);
+}
+
+/*
+  are we recording video?  The phone app starts and stops recording
+  without going through toggle_recording(), so ask the recorder
+ */
+static bool camera_is_recording(void)
+{
+    if (recording_end_pending) {
+        return false; // stopping, once it has run for MIN_RECORDING_MS
+    }
+    return schedrec_state() == 1 || (disable_sd_save && uart_data.is_recording_video);
+}
+
+static void camera_update_video_state(void)
+{
+    const bool on = camera_is_recording();
+    if (on && !camera_video_on) {
+        camera_video_start_ms = uart_data.is_recording_video ? recording_start_ms : get_time_boot_ms();
+    }
+    camera_video_on = on;
+}
+
+static void camera_send_capture_status(void)
+{
+    camera_update_video_state();
+
+    mavlink_camera_capture_status_t status;
+    memset(&status, 0, sizeof(status));
+    status.time_boot_ms = get_time_boot_ms();
+    status.image_status = (camera_photo_in_progress || camera_photos_queued > 0) ? 1 : 0;
+    status.video_status = camera_video_on ? 1 : 0;
+    if (camera_video_on) {
+        status.recording_time_ms = get_time_boot_ms() - camera_video_start_ms;
+    }
+    status.available_capacity = camera_free_mib;
+    status.image_count = camera_image_count;
+
+    mavlink_message_t msg;
+    mavlink_msg_camera_capture_status_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+                                                    &msg, &status);
+    camera_send(&msg);
+}
+
+// fills in storage, and remembers the free space for CAMERA_CAPTURE_STATUS
+static void camera_read_storage(mavlink_storage_information_t *s)
+{
+    mavlink_storage_information_t storage;
+    memset(&storage, 0, sizeof(storage));
+    storage.time_boot_ms = get_time_boot_ms();
+    storage.storage_id = 1;
+    storage.storage_count = 1;
+    storage.type = STORAGE_TYPE_MICROSD;
+    strncpy(storage.name, "microSD", sizeof(storage.name));
+    storage.read_speed = NAN;
+    storage.write_speed = NAN;
+
+    FATFS *fs = NULL;
+    DWORD free_clusters = 0;
+    if (f_getfree("0:", &free_clusters, &fs) == FR_OK && fs != NULL) {
+        const float mib_per_cluster = fs->csize * 512.0f / (1024 * 1024);
+        storage.status = STORAGE_STATUS_READY;
+        storage.total_capacity = (fs->n_fatent - 2) * mib_per_cluster;
+        storage.available_capacity = free_clusters * mib_per_cluster;
+        storage.used_capacity = storage.total_capacity - storage.available_capacity;
+        camera_free_mib = storage.available_capacity;
+    } else {
+        storage.status = STORAGE_STATUS_EMPTY;
+        camera_free_mib = 0;
+    }
+    *s = storage;
+}
+
+static void camera_send_storage_information(void)
+{
+    mavlink_storage_information_t storage;
+    camera_read_storage(&storage);
+
+    mavlink_message_t msg;
+    mavlink_msg_storage_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+                                                  &msg, &storage);
+    camera_send(&msg);
+}
+
+static void camera_send_image_captured(int32_t index, bool success)
+{
+    mavlink_camera_image_captured_t captured;
+    memset(&captured, 0, sizeof(captured));
+    captured.time_boot_ms = get_time_boot_ms();
+    captured.time_utc = (uint64_t)fc_unix_time * 1000000ULL;
+    captured.lat = camera_position.lat;
+    captured.lon = camera_position.lon;
+    captured.alt = camera_position.alt;
+    captured.relative_alt = camera_position.relative_alt;
+    captured.q[0] = NAN; // orientation unknown
+    captured.image_index = index;
+    captured.capture_result = success ? 1 : 0;
+
+    mavlink_message_t msg;
+    mavlink_msg_camera_image_captured_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+                                                    &msg, &captured);
+    camera_send(&msg);
+}
+
+static void camera_send_ack(const mavlink_message_t *request, uint16_t command, uint8_t result)
+{
+    mavlink_message_t msg;
+    mavlink_msg_command_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+                                        command, result,
+                                        0, 0, // progress, result_param2
+                                        request->sysid, request->compid);
+    camera_send(&msg);
+}
+
+/*
+  send one of the camera messages; false if we don't do that message
+ */
+static bool camera_send_message(uint32_t msgid)
+{
+    switch (msgid) {
+    case MAVLINK_MSG_ID_HEARTBEAT:
+        camera_send_heartbeat();
+        return true;
+    case MAVLINK_MSG_ID_CAMERA_INFORMATION:
+        camera_send_information();
+        return true;
+    case MAVLINK_MSG_ID_VIDEO_STREAM_INFORMATION:
+        camera_send_stream_information();
+        return true;
+    case MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS:
+        camera_send_capture_status();
+        return true;
+    case MAVLINK_MSG_ID_STORAGE_INFORMATION:
+        camera_send_storage_information();
+        return true;
+    }
+    return false;
+}
+
+static uint8_t camera_take_photo(const mavlink_message_t *msg, const mavlink_command_long_t *c)
+{
+    // single shots only; no intervals or bursts
+    if (c->param2 > 0 || (int)c->param3 != 1) {
+        return MAV_RESULT_UNSUPPORTED;
+    }
+    if (disable_sd_save || mf_snapshot_get_isfull() == 1) {
+        return MAV_RESULT_DENIED;
+    }
+    // the GCS numbers its captures so that a command sent again (as
+    // when our ACK was lost) doesn't take a second photo
+    const uint32_t seq = (uint32_t)c->param4;
+    const uint32_t now = get_time_boot_ms();
+    if (seq != 0 && seq == camera_capture_seq &&
+        msg->sysid == camera_capture_sysid && msg->compid == camera_capture_compid &&
+        now - camera_capture_ms < CAMERA_PHOTO_TIMEOUT_MS) {
+        return MAV_RESULT_ACCEPTED;
+    }
+    if (camera_photos_queued >= CAMERA_MAX_QUEUED_PHOTOS) {
+        return MAV_RESULT_TEMPORARILY_REJECTED;
+    }
+    camera_photos_queued++;
+    camera_capture_seq = seq;
+    camera_capture_sysid = msg->sysid;
+    camera_capture_compid = msg->compid;
+    camera_capture_ms = now;
+    return MAV_RESULT_ACCEPTED;
+}
+
+// give up on the queued photos, telling the GCS each one failed
+static void camera_drop_queued_photos(void)
+{
+    while (camera_photos_queued > 0) {
+        camera_photos_queued--;
+        camera_send_image_captured(camera_image_count, false);
+    }
+}
+
+/*
+  start queued photos and report finished ones; called every time
+  round the main loop
+ */
+static void camera_photo_update(void)
+{
+    static uint32_t last_update_ms;
+    const uint32_t now = get_time_boot_ms();
+
+    // check_takepic_task() logs each call, so don't ask too often
+    if (now - last_update_ms < 100) {
+        return;
+    }
+    last_update_ms = now;
+
+    if (camera_photo_in_progress) {
+        unsigned saved, failed, pending;
+        mf_snapshot_get_results(&saved, &failed, &pending);
+        const bool written = saved != camera_photo_saved_before;
+        const bool done = written || failed != camera_photo_failed_before;
+        if (!done && now - camera_photo_start_ms < CAMERA_PHOTO_TIMEOUT_MS) {
+            return;
+        }
+        camera_photo_in_progress = false;
+        camera_send_image_captured(camera_image_count, written);
+        if (written) {
+            camera_image_count++;
+        }
+        if (!done) {
+            // the snapshot code may be stuck; don't leave the GCS
+            // waiting on photos behind it
+            console_printf("camera: photo timed out\n");
+            camera_drop_queued_photos();
+        }
+        camera_send_capture_status();
+    }
+
+    if (camera_photos_queued == 0) {
+        return;
+    }
+
+    // a snapshot started some other way (e.g. the transmitter's
+    // button) has to be taken and written before we start ours, so
+    // that its result isn't taken for ours
+    unsigned saved_before, failed_before, pending;
+    mf_snapshot_get_results(&saved_before, &failed_before, &pending);
+    if (check_takepic_task() != 0 || pending != 0) {
+        if (!camera_queue_blocked) {
+            camera_queue_blocked = true;
+            camera_queue_blocked_ms = now;
+        } else if (now - camera_queue_blocked_ms > CAMERA_PHOTO_TIMEOUT_MS) {
+            console_printf("camera: snapshot stuck; dropping queued photos\n");
+            camera_drop_queued_photos();
+            camera_queue_blocked = false;
+            camera_send_capture_status();
+        }
+        return;
+    }
+    camera_queue_blocked = false;
+
+    camera_photos_queued--;
+    camera_photo_saved_before = saved_before;
+    camera_photo_failed_before = failed_before;
+    if (take_snapshot()) {
+        camera_photo_in_progress = true;
+        camera_photo_start_ms = now;
+    } else {
+        // e.g. the photo folder has filled up
+        camera_send_image_captured(camera_image_count, false);
+        camera_send_capture_status();
+    }
+}
+
+/*
+  a command from the GCS addressed to the camera
+ */
+static void camera_handle_command(const mavlink_message_t *msg)
+{
+    mavlink_command_long_t c;
+    mavlink_msg_command_long_decode(msg, &c);
+    if (c.target_system != fc_sysid || c.target_component != CAMERA_COMPONENT_ID) {
+        return;
+    }
+
+    uint8_t result = MAV_RESULT_UNSUPPORTED;
+    // message to send once ACKed, if any (not 0: that's HEARTBEAT)
+    uint32_t send_after_ack = UINT32_MAX;
+
+    switch (c.command) {
+    case MAV_CMD_REQUEST_MESSAGE:
+        // ACK every one promptly: QGC holds back further requests to
+        // us while one is outstanding
+        if ((int)c.param1 == MAVLINK_MSG_ID_VIDEO_STREAM_INFORMATION && c.param2 > 1) {
+            break; // we only have stream 1
+        }
+        switch ((uint32_t)c.param1) {
+        case MAVLINK_MSG_ID_HEARTBEAT:
+        case MAVLINK_MSG_ID_CAMERA_INFORMATION:
+        case MAVLINK_MSG_ID_VIDEO_STREAM_INFORMATION:
+        case MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS:
+        case MAVLINK_MSG_ID_STORAGE_INFORMATION:
+            result = MAV_RESULT_ACCEPTED;
+            send_after_ack = (uint32_t)c.param1;
+            break;
+        }
+        break;
+
+    // the older way of asking for the same messages
+    case MAV_CMD_REQUEST_CAMERA_INFORMATION:
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_CAMERA_INFORMATION;
+        break;
+    case MAV_CMD_REQUEST_VIDEO_STREAM_INFORMATION:
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_VIDEO_STREAM_INFORMATION;
+        break;
+    case MAV_CMD_REQUEST_CAMERA_CAPTURE_STATUS:
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS;
+        break;
+    case MAV_CMD_REQUEST_STORAGE_INFORMATION:
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_STORAGE_INFORMATION;
+        break;
+
+    case MAV_CMD_IMAGE_START_CAPTURE:
+        result = camera_take_photo(msg, &c);
+        send_after_ack = MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS;
+        break;
+    case MAV_CMD_IMAGE_STOP_CAPTURE:
+        // nothing runs on after a single shot
+        result = MAV_RESULT_ACCEPTED;
+        break;
+
+    case MAV_CMD_VIDEO_START_CAPTURE:
+        if (!camera_is_recording()) {
+            // the flag can be stale, e.g. if the card filled up
+            uart_data.is_recording_video = false;
+            toggle_recording();
+        }
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS;
+        break;
+    case MAV_CMD_VIDEO_STOP_CAPTURE:
+        if (camera_is_recording()) {
+            // it may have been started from the phone app
+            uart_data.is_recording_video = true;
+            toggle_recording();
+        }
+        result = MAV_RESULT_ACCEPTED;
+        send_after_ack = MAVLINK_MSG_ID_CAMERA_CAPTURE_STATUS;
+        break;
+    }
+
+    camera_send_ack(msg, c.command, result);
+    if (send_after_ack != UINT32_MAX) {
+        camera_send_message(send_after_ack);
+    }
+}
+
+// is this message addressed to the camera?
+static bool camera_is_target(const mavlink_message_t *msg)
+{
+    const mavlink_msg_entry_t *e = mavlink_get_msg_entry(msg->msgid);
+    if (e == NULL || !(e->flags & MAV_MSG_ENTRY_FLAG_HAVE_TARGET_COMPONENT)) {
+        return false;
+    }
+    const uint8_t *payload = (const uint8_t *)_MAV_PAYLOAD(msg);
+    return payload[e->target_system_ofs] == fc_sysid &&
+        payload[e->target_component_ofs] == CAMERA_COMPONENT_ID;
+}
+
+/*
+  look at a UDP packet from the GCS before it goes to the flight
+  controller; returns true if it must not go there:
+
+  - one of our own broadcasts heard back.  Each of those is a single
+    message, so the header tells us.
+
+  - nothing but messages addressed to the camera.  The flight
+    controller has no route to us (we never send it anything), so it
+    would act on them itself: ArduPilot handles a message for its own
+    system ID with an unknown component as if it were addressed to it.
+ */
+static bool camera_udp_input(const uint8_t *buf, ssize_t len)
+{
+    if (fc_sysid != 0) {
+        if ((len >= 7 && buf[0] == MAVLINK_STX && buf[5] == fc_sysid && buf[6] == CAMERA_COMPONENT_ID) ||
+            (len >= 5 && buf[0] == MAVLINK_STX_MAVLINK1 && buf[3] == fc_sysid && buf[4] == CAMERA_COMPONENT_ID)) {
+            if (camera_own_packets++ == 0) {
+                console_printf("camera: dropping our own broadcasts heard back\n");
+            }
+            return true;
+        }
+    }
+
+    // our own parser state, so as not to need another MAVLink channel
+    static mavlink_message_t rxmsg;
+    static mavlink_status_t rxstatus;
+    bool for_camera = false, for_others = false;
+    ssize_t i;
+    for (i = 0; i < len; i++) {
+        mavlink_message_t msg;
+        mavlink_status_t status;
+        if (mavlink_frame_char_buffer(&rxmsg, &rxstatus, buf[i], &msg, &status) != MAVLINK_FRAMING_OK ||
+            fc_sysid == 0) {
+            continue;
+        }
+        if (!camera_is_target(&msg)) {
+            for_others = true;
+            continue;
+        }
+        for_camera = true;
+        if (msg.msgid == MAVLINK_MSG_ID_COMMAND_LONG) {
+            camera_handle_command(&msg);
+        }
+    }
+    // only whole messages, all for us; anything else goes on as it was
+    return for_camera && !for_others && rxstatus.parse_state == MAVLINK_PARSE_STATE_IDLE;
+}
+
+static void camera_periodic(void)
+{
+    static uint32_t last_camera_ms;
+    uint32_t now = get_time_boot_ms();
+
+    // only while there's a vehicle for the camera to be part of
+    if (fc_sysid == 0 || now - last_heartbeat_ms > 3000) {
+        return;
+    }
+
+    camera_photo_update();
+    if (now - last_camera_ms < 1000) {
+        return;
+    }
+    last_camera_ms = now;
+
+    // free space for CAMERA_CAPTURE_STATUS; FatFs keeps the free
+    // cluster count once it has counted them, so this is cheap
+    static uint32_t last_storage_ms;
+    if (last_storage_ms == 0 || now - last_storage_ms > 10000) {
+        mavlink_storage_information_t storage;
+        camera_read_storage(&storage);
+        last_storage_ms = now;
+    }
+
+    camera_send_heartbeat();
+    camera_send_information();
+    camera_send_stream_information();
+    // QGC leaves its buttons showing "busy" until it hears this
+    camera_send_capture_status();
 }
 
 /*
@@ -771,6 +1257,7 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
         uart_data.altitude = swap_int16(m.relative_alt/10); // in cm
         gps_data.latitude = swap_int32(m.lat);
         gps_data.longitude = swap_int32(m.lon);
+        camera_position = m;
         break;
     }
     case MAVLINK_MSG_ID_SYS_STATUS: {
@@ -1292,6 +1779,7 @@ static void handle_rc_input(mavlink_message_t *msg)
 static void mavlink_main(void *pvParameters, int udp_sock)
 {
     console_printf("Starting mavlink_wifi main\n");
+    camera_udp_sock = udp_sock;
 
     while (telem_mode == telem_mode_requested) {
         fd_set fds;
@@ -1414,7 +1902,7 @@ static void mavlink_main(void *pvParameters, int udp_sock)
 	mavlink_check_baudrate();
 	tx_upload_periodic();
         check_video_recording_end();
-        camera_periodic(udp_sock);
+        camera_periodic();
     }
 }
 
