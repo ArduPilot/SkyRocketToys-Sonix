@@ -45,6 +45,7 @@ int mf_snapshot_status(void);
 void mf_snapshot_update_size(long long iUsedSize, long long iCanuseSize);
 int mf_snapshot_get_isfull(void);
 int mf_snapshot_get_queue_num(void);
+void mf_snapshot_get_results(unsigned int *saved, unsigned int *failed, unsigned int *pending);
 int del_snapshot_file(char *fn);
 
 int mf_thumbnail_init(void);
