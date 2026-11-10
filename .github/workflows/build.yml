@@ -1,0 +1,37 @@
+name: build
+
+on: [push, pull_request, workflow_dispatch]
+
+concurrency:
+  group: ci-${{github.workflow}}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # the toolchain in tool/ is 32-bit; lxml lets mavgen validate the XML
+      - name: install packages
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libc6:i386 zlib1g:i386 python3-lxml libencode-detect-perl libdigest-crc-perl
+
+      - name: build
+        working-directory: buildscript
+        run: |
+          make oldconfig </dev/null
+          make clean
+          make mavlink
+          make
+          make install
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FIRMWARE_660R-${{ github.sha }}
+          path: image/dashcam/FIRMWARE_660R.bin
+          if-no-files-found: error
