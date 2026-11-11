@@ -8,8 +8,7 @@
 
   The SkyViper's camera is fixed to the vehicle, looking straight
   ahead, so the "gimbal" attitude is the vehicle's roll and pitch with
-  zero relative yaw.  The lens's field of view hasn't been measured,
-  so hfov_deg is null.
+  zero relative yaw.
 
   The SDK's printf has no floating point, so the JSON is written from
   fixed point integers.
@@ -24,6 +23,14 @@
 #include "video_telemetry.h"
 
 #define TELEMETRY_MAX_AGE_MS 10000  // older values are given as null
+
+/*
+  the camera's horizontal field of view, edge to edge: at 140mm from a
+  ruler the 1280x720 preview showed 142mm left and 143mm right of its
+  centre.  The lens has strong barrel distortion, so near the centre
+  of the picture it's more like a 74 degree pinhole camera.
+ */
+#define CAMERA_HFOV "91.0"
 #define JSON_MAX 640   // all the fields are about 500 bytes
 #define SEI_MAX (JSON_MAX + 32)
 
@@ -256,7 +263,7 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
     } else {
         put_str(&j, "null");
     }
-    put_str(&j, ",\"zoom\":1.000,\"hfov_deg\":null}");
+    put_str(&j, ",\"zoom\":1.000,\"hfov_deg\":" CAMERA_HFOV "}");
 
     return j.full ? 0 : j.len;
 }
