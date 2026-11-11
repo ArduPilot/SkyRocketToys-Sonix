@@ -53,7 +53,19 @@ static struct {
     int16_t vn_cm_s, ve_cm_s, vd_cm_s;
     int32_t heading_urad;                        // -1 if unknown
     uint64_t unix_us;
+    // the time the web interface or phone app gave, for when the
+    // flight controller doesn't know it
+    bool have_given_time;
+    uint32_t given_ms;
+    uint64_t given_unix_us;
 } telem;
+
+/*
+  a given time is only to the second, and the web interface gives it
+  every 20 seconds: keep the first unless it's out by more than this,
+  so the time in a recording doesn't jump about
+ */
+#define GIVEN_TIME_SLACK_US 2000000ULL
 
 void video_telemetry_attitude(const mavlink_attitude_t *m)
 {
@@ -98,6 +110,25 @@ void video_telemetry_system_time(const mavlink_system_time_t *m)
     telem.unix_us = m->time_unix_usec;
     telem.time_ms = get_time_boot_ms();
     telem.have_time = true;
+    taskEXIT_CRITICAL();
+}
+
+void video_telemetry_given_time(uint32_t unix_seconds)
+{
+    const uint64_t given_us = (uint64_t)unix_seconds * 1000000;
+    taskENTER_CRITICAL();
+    const uint32_t now_ms = get_time_boot_ms();
+    if (telem.have_given_time) {
+        const uint64_t ours = telem.given_unix_us + (uint64_t)(now_ms - telem.given_ms) * 1000;
+        const uint64_t diff = ours > given_us ? ours - given_us : given_us - ours;
+        if (diff <= GIVEN_TIME_SLACK_US) {
+            taskEXIT_CRITICAL();
+            return;
+        }
+    }
+    telem.given_unix_us = given_us;
+    telem.given_ms = now_ms;
+    telem.have_given_time = true;
     taskEXIT_CRITICAL();
 }
 
@@ -197,6 +228,9 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
     if (t.have_time) {
         // the flight controller's last time, carried on by our clock
         put_uint(&j, t.unix_us + (uint64_t)(now_ms - t.time_ms) * 1000, 0);
+    } else if (t.have_given_time) {
+        // the time we were given, e.g. with no GPS: good to a second or so
+        put_uint(&j, t.given_unix_us + (uint64_t)(now_ms - t.given_ms) * 1000, 0);
     } else {
         put_str(&j, "null");
     }
