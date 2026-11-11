@@ -191,7 +191,8 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
     bool have_position = fresh(t.position_ms, now_ms);
     uint32_t position_age = now_ms - t.position_ms;
     put_str(&j, ",\"position\":");
-    if (have_position) {
+    // without a position the flight controller sends 0 latitude and longitude
+    if (have_position && (t.lat_e7 != 0 || t.lon_e7 != 0)) {
         put_str(&j, "{\"lat_e7\":");
         put_int(&j, t.lat_e7);
         put_str(&j, ",\"lon_e7\":");
