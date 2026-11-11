@@ -44,6 +44,9 @@
 #include "mcu.h"
 #endif
 #include "rec_seed.h"
+#if CONFIG_MAVLINK_WIFI
+#include "../ArduPilot/video_telemetry.h"
+#endif
 
 
 extern char **g_Filelist;
@@ -336,6 +339,28 @@ void recordvideo(unsigned char iframe, unsigned char *pframe, unsigned int uifra
 			chk_gsensorinfo(sdrecord_info);
 #endif
 		}
+#if CONFIG_MAVLINK_WIFI
+		{
+			/*
+			  the telemetry SEI goes in a copy of the frame.  The MP4
+			  writer renumbers P-frames by rewriting bytes 6 and 7 of
+			  the frame, which it takes to be the slice header, so in
+			  them the SEI goes after the slice; in I-frames it goes
+			  before the slice, after the SPS and PPS.  A reader that
+			  takes the SEIs from each MP4 sample gets every frame's
+			  telemetry, but a P-frame's comes after its slice, so a
+			  decoder ignores it ("Late SEI" in FFmpeg) and a
+			  raw-H.264 extraction puts it with the next frame
+			 */
+			unsigned annotated_size;
+			unsigned char *annotated = video_telemetry_insert(VIDEO_TELEMETRY_RECORD, pframe, uiframeSize,
+			                                                  &tval, iframe != 1, 0, &annotated_size);
+			if (annotated != NULL) {
+				pframe = annotated;
+				uiframeSize = annotated_size;
+			}
+		}
+#endif
 		record_video(sdrecord_info->pRecord_info, iframe, pframe, uiframeSize, tval);
 	}
 }

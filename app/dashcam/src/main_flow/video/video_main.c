@@ -628,7 +628,8 @@ void send_preview_to_rtp(unsigned char IFrame, unsigned char *pFrame,
 	if (annotating) {
 		// the telemetry SEI goes in a copy, with room for the trailer below
 		unsigned annotated_size;
-		unsigned char *annotated = video_telemetry_insert(pFrame, uiFrameSize, &tval, 8, &annotated_size);
+		unsigned char *annotated = video_telemetry_insert(VIDEO_TELEMETRY_PREVIEW, pFrame, uiFrameSize,
+		                                                  &tval, false, 8, &annotated_size);
 		if (annotated != NULL) {
 			pFrame = annotated;
 			uiFrameSize = annotated_size;
