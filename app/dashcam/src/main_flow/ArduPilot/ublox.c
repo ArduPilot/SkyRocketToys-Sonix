@@ -17,6 +17,7 @@
 #include "util/print_vprintf.h"
 #include <libmid_nvram/snx_mid_nvram.h>
 #include "record/rec_schedule.h"
+#include "video_telemetry.h"
 
 #define LEAPSECS_SINCE_1980 0x80
 
@@ -770,6 +771,9 @@ void handle_ublox_data(const uint8_t *data, const uint32_t data_len)
  */
 void ublox_set_position(const struct mga_position *pos)
 {
+    if (pos && pos->utc_time > UBLOX_MIN_DATE) {
+        video_telemetry_given_time(pos->utc_time);
+    }
     if (pos && pos_source <= POS_SOURCE_APP) {
         mga_pos_estimate = *pos;
         pos_source = POS_SOURCE_APP;
@@ -781,6 +785,9 @@ void ublox_set_position(const struct mga_position *pos)
 
 void ublox_set_time(uint32_t utc_time)
 {
+    if (utc_time > UBLOX_MIN_DATE) {
+        video_telemetry_given_time(utc_time);
+    }
     if (utc_time > UBLOX_MIN_DATE &&
         time_source < TIME_SOURCE_APP) {
         mga_pos_estimate.utc_time = utc_time;

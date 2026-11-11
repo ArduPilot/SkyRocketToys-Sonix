@@ -21,6 +21,12 @@ void video_telemetry_attitude(const struct __mavlink_attitude_t *m);
 void video_telemetry_position(const struct __mavlink_global_position_int_t *m);
 void video_telemetry_system_time(const struct __mavlink_system_time_t *m);
 
+/*
+  the UTC time from the web interface or phone app, used when the
+  flight controller doesn't know the time, e.g. with no GPS
+ */
+void video_telemetry_given_time(uint32_t unix_seconds);
+
 enum video_telemetry_stream {
     VIDEO_TELEMETRY_PREVIEW,    // the live preview, to RTSP
     VIDEO_TELEMETRY_RECORD,     // the recording, to the SD card
