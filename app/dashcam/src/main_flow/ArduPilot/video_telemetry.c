@@ -276,9 +276,9 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
   the SEI NAL unit, with its start code, for some JSON; its length, or
   0 if it doesn't fit
  */
-static unsigned telemetry_sei(const char *json, unsigned json_len, uint8_t *out, unsigned size)
+static unsigned telemetry_sei(const char *json, unsigned json_len, uint8_t *rbsp,
+                              uint8_t *out, unsigned size)
 {
-    static uint8_t rbsp[SEI_MAX];
     unsigned used = 0, written = 0, zeros = 0, i;
     unsigned payload = sizeof(apcg_uuid) + json_len;
 
@@ -343,49 +343,56 @@ static int first_slice(const uint8_t *frame, unsigned length)
 }
 
 /*
-  only ever called from the one task sending the preview, so its
-  buffers are static, off that task's stack
+  each stream is sent by its own task, so has its own buffers, which
+  are static to keep them off those tasks' stacks
  */
-uint8_t *video_telemetry_insert(const uint8_t *frame, unsigned length,
-                                const struct timeval *tv, unsigned spare_bytes,
-                                unsigned *new_length)
+static struct telemetry_buffers {
+    uint8_t *frame;          // the frame with its SEI
+    unsigned frame_size;
+    char json[JSON_MAX];
+    uint8_t rbsp[SEI_MAX];
+    uint8_t sei[SEI_MAX];
+} buffers[VIDEO_TELEMETRY_STREAMS];
+
+uint8_t *video_telemetry_insert(enum video_telemetry_stream stream,
+                                const uint8_t *frame, unsigned length,
+                                const struct timeval *tv, bool sei_last,
+                                unsigned spare_bytes, unsigned *new_length)
 {
-    static uint8_t *buf;
-    static unsigned buf_size;
-    static char json[JSON_MAX];
-    static uint8_t sei[SEI_MAX];
+    struct telemetry_buffers *b = &buffers[stream];
 
     int slice = first_slice(frame, length);
     if (slice < 0) {
         return NULL;
     }
+    unsigned at = sei_last ? length : (unsigned)slice;
 
     // the frame's capture time in 90kHz ticks
     uint32_t pts90k = (uint32_t)((uint64_t)tv->tv_sec * 90000 + (uint64_t)tv->tv_usec * 9 / 100);
-    unsigned json_len = telemetry_json(pts90k, json, sizeof(json));
-    unsigned sei_len = telemetry_sei(json, json_len, sei, sizeof(sei));
+    unsigned json_len = telemetry_json(pts90k, b->json, sizeof(b->json));
+    unsigned sei_len = telemetry_sei(b->json, json_len, b->rbsp, b->sei, sizeof(b->sei));
     if (sei_len == 0) {
         return NULL;
     }
 
     unsigned needed = length + sei_len + spare_bytes;
-    if (needed > buf_size) {
+    if (needed > b->frame_size) {
         // grow by a quarter more, so a few bigger I-frames don't each
         // need another allocation
         unsigned size = needed + needed / 4;
-        if (buf != NULL) {
-            vPortFree(buf);
+        if (b->frame != NULL) {
+            vPortFree(b->frame);
         }
-        buf = pvPortMalloc(size, GFP_KERNEL, MODULE_APP);
-        buf_size = buf != NULL ? size : 0;
-        if (buf == NULL) {
+        b->frame = pvPortMalloc(size, GFP_KERNEL, MODULE_APP);
+        b->frame_size = b->frame != NULL ? size : 0;
+        if (b->frame == NULL) {
             return NULL;
         }
     }
 
-    memcpy(buf, frame, slice);
-    memcpy(buf + slice, sei, sei_len);
-    memcpy(buf + slice + sei_len, frame + slice, length - slice);
+    memcpy(b->frame, frame, at);
+    memcpy(b->frame + at, b->sei, sei_len);
+    memcpy(b->frame + at + sei_len, frame + at, length - at);
     *new_length = length + sei_len;
-    return buf;
+    return b->frame;
 }
