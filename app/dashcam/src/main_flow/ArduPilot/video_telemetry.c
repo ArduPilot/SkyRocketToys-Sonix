@@ -171,11 +171,13 @@ static bool fresh(uint32_t received_ms, uint32_t now_ms)
 static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
 {
     struct json j = { buf, 0, size, false };
-    uint32_t now_ms = get_time_boot_ms();
+    uint32_t now_ms;
     typeof(telem) t;
 
+    // the time is taken with the copy, so nothing in it is newer
     taskENTER_CRITICAL();
     t = telem;
+    now_ms = get_time_boot_ms();
     taskEXIT_CRITICAL();
 
     put_str(&j, "{\"schema\":\"apcg.telemetry.v1\",\"pts90k\":");
