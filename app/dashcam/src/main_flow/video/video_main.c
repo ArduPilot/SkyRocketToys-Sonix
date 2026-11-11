@@ -31,6 +31,9 @@
 #include "usbd_ext.h"
 #include <generated/snx_sdk_conf.h>
 #include "utility.h"
+#if CONFIG_MAVLINK_WIFI
+#include "../ArduPilot/video_telemetry.h"
+#endif
 
 //#define PREVIEW_ALWAYS_ENABLE	0	/**<  1:always enable preview path even if no user uses preview*/
 
@@ -594,6 +597,45 @@ void send_preview_to_rtp(unsigned char IFrame, unsigned char *pFrame,
 	pre_time = cur_time;
 #endif
 
+#if CONFIG_MAVLINK_WIFI
+	/*
+	  factory mode gives both encoders' frames to the preview, from
+	  two tasks, and the telemetry copy is reused for each frame.  So
+	  while one task's frame is being annotated and sent, the other's
+	  go without telemetry.
+
+	  An ISP0 restart deletes its preview task wherever it is, which
+	  may be in here.  So a task that finds itself still holding the
+	  telemetry (its handle reused for the new task) takes it, as does
+	  any once the holder has had it far longer than a send takes
+	 */
+	static xTaskHandle preview_annotator;
+	static portTickType preview_annotator_since;
+	const xTaskHandle me = xTaskGetCurrentTaskHandle();
+	bool annotating;
+	taskENTER_CRITICAL();
+	// the time is taken in here: taken before, another task could
+	// take the telemetry in between, and its hold then look far older
+	// than it is
+	const portTickType now = xTaskGetTickCount();
+	annotating = preview_annotator == NULL || preview_annotator == me ||
+	             now - preview_annotator_since > 2000 / portTICK_RATE_MS;
+	if (annotating) {
+		preview_annotator = me;
+		preview_annotator_since = now;
+	}
+	taskEXIT_CRITICAL();
+	if (annotating) {
+		// the telemetry SEI goes in a copy, with room for the trailer below
+		unsigned annotated_size;
+		unsigned char *annotated = video_telemetry_insert(pFrame, uiFrameSize, &tval, 8, &annotated_size);
+		if (annotated != NULL) {
+			pFrame = annotated;
+			uiFrameSize = annotated_size;
+		}
+	}
+#endif
+
 	if (IFrame == pdTRUE) {
 		app_frameadddata frame_addtional_information;
 		addtional_info(&frame_addtional_information);      //0x53 0x4E(tag)
@@ -608,6 +650,16 @@ void send_preview_to_rtp(unsigned char IFrame, unsigned char *pFrame,
 		send_rtp_data(Livestream_id & 0xFFFF, (char *)pFrame, uiFrameSize + 8, NULL, PREVIEW_STREAM);
 	} else
 		send_rtp_data(Livestream_id & 0xFFFF, (char *)pFrame, uiFrameSize, NULL, PREVIEW_STREAM);
+#if CONFIG_MAVLINK_WIFI
+	if (annotating) {
+		// unless another task has taken it
+		taskENTER_CRITICAL();
+		if (preview_annotator == me) {
+			preview_annotator = NULL;
+		}
+		taskEXIT_CRITICAL();
+	}
+#endif
 	/*
 	video_id = id & 0xFFFF;
 	audio_id = id >> 16;

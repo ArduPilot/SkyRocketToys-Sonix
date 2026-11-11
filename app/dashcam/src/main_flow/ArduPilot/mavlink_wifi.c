@@ -34,6 +34,7 @@
 #include <libmid_nvram/snx_mid_nvram.h>
 #include "util/print_vprintf.h"
 #include "video_main.h"
+#include "video_telemetry.h"
 #include <../sensor_cap/sensor_capability.h>
 #include "../utility/utility.h"
 #include "../errno.h"
@@ -1921,6 +1922,7 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
     case MAVLINK_MSG_ID_ATTITUDE: {
 	mavlink_attitude_t m;
 	mavlink_msg_attitude_decode(msg, &m);
+        video_telemetry_attitude(&m);
         attitude_data.roll = swap_int16(degrees(m.roll)*100);
         attitude_data.pitch = swap_int16(degrees(m.pitch)*100);
         attitude_data.yaw = swap_int16(degrees(m.yaw)*100);
@@ -1941,6 +1943,7 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
     case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
 	mavlink_global_position_int_t m;
 	mavlink_msg_global_position_int_decode(msg, &m);
+        video_telemetry_position(&m);
         uart_data.altitude = swap_int16(m.relative_alt/10); // in cm
         gps_data.latitude = swap_int32(m.lat);
         gps_data.longitude = swap_int32(m.lon);
@@ -1969,6 +1972,7 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
             }
             last_fc_boot_ms = m.time_boot_ms;
         }
+        video_telemetry_system_time(&m);
         fc_unix_time = m.time_unix_usec/1000000; // microseconds->seconds
         gps_pos.utc_time = fc_unix_time;
         gps_pos.time_base = get_sys_seconds_boot();
