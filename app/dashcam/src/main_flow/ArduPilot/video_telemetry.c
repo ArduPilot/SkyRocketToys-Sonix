@@ -45,7 +45,8 @@ static const uint8_t apcg_uuid[16] = {
   inside critical sections
  */
 static struct {
-    uint32_t attitude_ms, position_ms, time_ms;  // when received, 0 if never
+    bool have_attitude, have_position, have_time;
+    uint32_t attitude_ms, position_ms, time_ms;  // when received
     int32_t roll_urad, pitch_urad, yaw_urad;
     int32_t lat_e7, lon_e7;
     int32_t alt_mm, relative_alt_mm;
@@ -63,7 +64,8 @@ void video_telemetry_attitude(const mavlink_attitude_t *m)
     telem.roll_urad = roll;
     telem.pitch_urad = pitch;
     telem.yaw_urad = yaw;
-    telem.attitude_ms = get_time_boot_ms() | 1;
+    telem.attitude_ms = get_time_boot_ms();
+    telem.have_attitude = true;
     taskEXIT_CRITICAL();
 }
 
@@ -81,7 +83,8 @@ void video_telemetry_position(const mavlink_global_position_int_t *m)
     telem.ve_cm_s = m->vy;
     telem.vd_cm_s = m->vz;
     telem.heading_urad = heading;
-    telem.position_ms = get_time_boot_ms() | 1;
+    telem.position_ms = get_time_boot_ms();
+    telem.have_position = true;
     taskEXIT_CRITICAL();
 }
 
@@ -93,7 +96,8 @@ void video_telemetry_system_time(const mavlink_system_time_t *m)
     }
     taskENTER_CRITICAL();
     telem.unix_us = m->time_unix_usec;
-    telem.time_ms = get_time_boot_ms() | 1;
+    telem.time_ms = get_time_boot_ms();
+    telem.have_time = true;
     taskEXIT_CRITICAL();
 }
 
@@ -166,9 +170,9 @@ static void put_age(struct json *j, uint32_t age_ms)
     put_str(j, "}");
 }
 
-static bool fresh(uint32_t received_ms, uint32_t now_ms)
+static bool fresh(bool received, uint32_t received_ms, uint32_t now_ms)
 {
-    return received_ms != 0 && now_ms - received_ms <= TELEMETRY_MAX_AGE_MS;
+    return received && now_ms - received_ms <= TELEMETRY_MAX_AGE_MS;
 }
 
 /*
@@ -190,14 +194,14 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
     put_str(&j, "{\"schema\":\"apcg.telemetry.v1\",\"pts90k\":");
     put_uint(&j, pts90k, 0);
     put_str(&j, ",\"utc_us\":");
-    if (t.time_ms != 0) {
+    if (t.have_time) {
         // the flight controller's last time, carried on by our clock
         put_uint(&j, t.unix_us + (uint64_t)(now_ms - t.time_ms) * 1000, 0);
     } else {
         put_str(&j, "null");
     }
 
-    bool have_position = fresh(t.position_ms, now_ms);
+    bool have_position = fresh(t.have_position, t.position_ms, now_ms);
     uint32_t position_age = now_ms - t.position_ms;
     put_str(&j, ",\"position\":");
     // without a position the flight controller sends 0 latitude and longitude
@@ -228,7 +232,7 @@ static unsigned telemetry_json(uint32_t pts90k, char *buf, unsigned size)
         put_str(&j, "null");
     }
 
-    bool have_attitude = fresh(t.attitude_ms, now_ms);
+    bool have_attitude = fresh(t.have_attitude, t.attitude_ms, now_ms);
     uint32_t attitude_age = now_ms - t.attitude_ms;
     put_str(&j, ",\"vehicle_attitude\":");
     if (have_attitude) {
