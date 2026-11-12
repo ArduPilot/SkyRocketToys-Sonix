@@ -51,59 +51,71 @@ static void ensure_log_basedir_exists()
 }
 
 /*
- * return a filename into which to write data for a new log
+ * the number of the last log created, from LASTLOG.TXT; 0 if unknown
  */
-static void new_log_filepath(char *path, const int len)
+static uint16_t read_lastlog_number(void)
 {
-    ensure_log_basedir_exists();
-
     const char *lastlog_filepath = REMOTE_LOG_BASEDIR "/LASTLOG.TXT";
-
-    uint16_t new_log_number = 1;
-
-    /* attempt to read number of last log created */
+    uint16_t number = 0;
     FIL lastlog_fptr;
     if (f_open(&lastlog_fptr, lastlog_filepath, FA_READ) == FR_OK) {
 	char buf[16];
         memset(buf, '\0', sizeof(buf));
 	unsigned int read_count;
-	if (f_read(&lastlog_fptr, buf, sizeof(buf), &read_count) == FR_OK) {
-	    const uint16_t last_log_number = atoi(buf);
-	    new_log_number = last_log_number + 1;
+	if (f_read(&lastlog_fptr, buf, sizeof(buf)-1, &read_count) == FR_OK) {
+	    number = atoi(buf);
 	}
 	f_close(&lastlog_fptr);
     }
+    return number;
+}
 
-    /* write out new last log created number */
-    if (f_open(&lastlog_fptr, lastlog_filepath, FA_CREATE_ALWAYS|FA_WRITE) == FR_OK) {
-	char buf[16];
-	memset(buf, '\0', sizeof(buf));
-	int used_bytes = snprintf(buf, sizeof(buf), "%u", new_log_number);
-	uint32_t bytes_written;
-	if (f_write(&lastlog_fptr, buf, used_bytes, &bytes_written) == FR_OK) {
-	    if (bytes_written != used_bytes) {
-		// whinge about short write
-		console_printf("rl: short write\n");
-	    }
-	} else {
-	    // whinge about failed write
-	    console_printf("rl: failed write\n");
-	}
-        f_sync(&lastlog_fptr);
-	f_close(&lastlog_fptr);
-    } else {
-	// moan about not being able to open log file
+/*
+ * record the number of the last log created in LASTLOG.TXT.
+ *
+ * It is overwritten in place and truncated, not opened with
+ * FA_CREATE_ALWAYS: truncating on open frees the file's cluster and
+ * makes FatFs search for the next free cluster from there, and as
+ * LASTLOG.TXT sits low on the card, the new log's first write then
+ * read the FAT past every used cluster after it, which took over 3
+ * seconds.  Nor is FA_OPEN_ALWAYS used, as this FatFs refuses that
+ * for a file which exists.
+ */
+static void write_lastlog_number(uint16_t number)
+{
+    const char *lastlog_filepath = REMOTE_LOG_BASEDIR "/LASTLOG.TXT";
+    FIL lastlog_fptr;
+    FRESULT res = f_open(&lastlog_fptr, lastlog_filepath, FA_OPEN_EXISTING|FA_WRITE);
+    if (res == FR_NO_FILE) {
+        res = f_open(&lastlog_fptr, lastlog_filepath, FA_CREATE_NEW|FA_WRITE);
+    }
+    if (res != FR_OK) {
+	// moan about not being able to open the file
         const long long now = get_sys_seconds_boot();
         if (last_lastlog_filepath_warning == 0 ||
             now - last_lastlog_filepath_warning > 10) {
-            console_printf("rl: failed to open (%s)\n", lastlog_filepath);
+            console_printf("rl: failed to open (%s) (%d)\n", lastlog_filepath, (int)res);
             last_lastlog_filepath_warning = now;
         }
+        return;
     }
-
-    memset(path, '\0', len);
-    const char *fmt = REMOTE_LOG_BASEDIR "/%06u.BIN";
-    snprintf(path, len, fmt, new_log_number);
+    char buf[16];
+    memset(buf, '\0', sizeof(buf));
+    int used_bytes = snprintf(buf, sizeof(buf), "%u", number);
+    uint32_t bytes_written;
+    if (f_write(&lastlog_fptr, buf, used_bytes, &bytes_written) == FR_OK) {
+	if (bytes_written != used_bytes) {
+	    // whinge about short write
+	    console_printf("rl: short write\n");
+	}
+    } else {
+	// whinge about failed write
+	console_printf("rl: failed write\n");
+    }
+    // drop anything left from a longer number
+    f_truncate(&lastlog_fptr);
+    f_sync(&lastlog_fptr);
+    f_close(&lastlog_fptr);
 }
 
 /*
@@ -112,16 +124,30 @@ static void new_log_filepath(char *path, const int len)
  */
 static int log_fh_open()
 {
-    new_log_filepath(log_filepath, sizeof(log_filepath));
-    if (f_open(&log_fh, log_filepath, FA_CREATE_ALWAYS|FA_WRITE) != FR_OK) {
+    ensure_log_basedir_exists();
+
+    // never overwrite a log: if LASTLOG.TXT is behind, skip any
+    // numbers already in use
+    uint16_t number = read_lastlog_number();
+    FRESULT res = FR_EXIST;
+    for (uint16_t tries = 0; tries < 1000 && res == FR_EXIST; tries++) {
+        number++;
+        if (number == 0) {
+            number = 1;
+        }
+        snprintf(log_filepath, sizeof(log_filepath), REMOTE_LOG_BASEDIR "/%06u.BIN", number);
+        res = f_open(&log_fh, log_filepath, FA_CREATE_NEW|FA_WRITE);
+    }
+    if (res != FR_OK) {
         const long long now = get_sys_seconds_boot();
         if (last_lastlog_logfh_warning == 0 ||
             now - last_lastlog_logfh_warning > 10) {
-            console_printf("rl: failed to open (%s)\n", log_filepath);
+            console_printf("rl: failed to open (%s) (%d)\n", log_filepath, (int)res);
             last_lastlog_logfh_warning = now;
         }
 	return -1;
     }
+    write_lastlog_number(number);
     console_printf("rl: new dataflash log (%s)\n", log_filepath);
     return 0;
 }
