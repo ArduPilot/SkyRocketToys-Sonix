@@ -448,12 +448,16 @@ static void send_named_int(const char *name, int32_t value)
   answer the camera commands the GCS sends us: still capture, video
   recording, and requests for the camera messages.
 
-  Our own broadcasts are never passed on to the flight controller, so
-  it doesn't learn about the camera component and route its traffic
-  onto other links.  Without that route it would act on messages for
-  the camera itself, so packets holding nothing but messages for the
-  camera aren't passed on either; everything else from the GCS goes
-  to the flight controller untouched, and we only look at a copy.
+  The flight controller gets our HEARTBEAT too, once a second, so it
+  knows the camera is on this link: its MAVLinkCamV2 backend
+  (CAMn_TYPE 6) finds us that way, asks us for CAMERA_INFORMATION and
+  the rest, and with CAMn_OPTIONS bit 0 starts and stops recording on
+  arming and disarming.  Commands and settings for the camera from it are
+  answered back to it.  Our broadcasts heard back aren't passed on to
+  it: that would only be wasted bytes on a busy UART.  Nor are packets
+  holding nothing but messages for the camera, which are ours to
+  answer; everything else from the GCS goes to the flight controller
+  untouched, and we only look at a copy.
  */
 #define CAMERA_COMPONENT_ID MAV_COMP_ID_CAMERA
 #define CAMERA_RTSP_URI "rtsp://192.168.99.1:554/" LIVE_PREVIEW_STREAM_NAME
@@ -467,7 +471,9 @@ static void send_named_int(const char *name, int32_t value)
 #define CAMERA_DEFINITION_VERSION 3
 
 static int camera_udp_sock = -1;
-static mavlink_status_t camera_status; // our own sequence numbers
+// our own sequence numbers, one set per link: a GCS counts a gap in
+// them as lost packets
+static mavlink_status_t camera_status, camera_fc_status;
 static int32_t camera_image_count;     // photos taken since boot
 
 /*
@@ -497,8 +503,22 @@ static uint32_t camera_own_packets;    // our broadcasts heard back, and dropped
 // where the vehicle is, for CAMERA_IMAGE_CAPTURED
 static mavlink_global_position_int_t camera_position;
 
+// while answering the flight controller, our replies go back to it
+static bool camera_reply_to_fc;
+
+static mavlink_status_t *camera_tx_status(void)
+{
+    return camera_reply_to_fc ? &camera_fc_status : &camera_status;
+}
+
 static void camera_send(mavlink_message_t *msg)
 {
+    if (camera_reply_to_fc) {
+        uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+        const uint16_t len = mavlink_msg_to_send_buffer(buf, msg);
+        mavlink_fc_write(buf, len);
+        return;
+    }
     if (camera_udp_sock != -1) {
         send_mavlink_wifi(camera_udp_sock, msg);
     }
@@ -507,7 +527,7 @@ static void camera_send(mavlink_message_t *msg)
 static void camera_send_heartbeat(void)
 {
     mavlink_message_t msg;
-    mavlink_msg_heartbeat_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+    mavlink_msg_heartbeat_pack_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(), &msg,
                                       MAV_TYPE_CAMERA, MAV_AUTOPILOT_INVALID,
                                       0, 0, MAV_STATE_ACTIVE);
     camera_send(&msg);
@@ -542,7 +562,7 @@ static void camera_send_information(void)
     strncpy(info.cam_definition_uri, CAMERA_DEFINITION_URI, sizeof(info.cam_definition_uri));
 
     mavlink_message_t msg;
-    mavlink_msg_camera_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+    mavlink_msg_camera_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(),
                                                  &msg, &info);
     camera_send(&msg);
 }
@@ -555,7 +575,7 @@ static void camera_send_stream_information(void)
     // QGC ignores later copies for a stream it already knows, so the
     // URI must not change
     mavlink_message_t msg;
-    mavlink_msg_video_stream_information_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+    mavlink_msg_video_stream_information_pack_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(), &msg,
                                                      1, 1, // stream 1 of 1
                                                      VIDEO_STREAM_TYPE_RTSP,
                                                      VIDEO_STREAM_STATUS_FLAGS_RUNNING,
@@ -605,7 +625,7 @@ static void camera_send_capture_status(void)
     status.image_count = camera_image_count;
 
     mavlink_message_t msg;
-    mavlink_msg_camera_capture_status_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+    mavlink_msg_camera_capture_status_encode_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(),
                                                     &msg, &status);
     camera_send(&msg);
 }
@@ -645,7 +665,7 @@ static void camera_send_storage_information(void)
     camera_read_storage(&storage);
 
     mavlink_message_t msg;
-    mavlink_msg_storage_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
+    mavlink_msg_storage_information_encode_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(),
                                                   &msg, &storage);
     camera_send(&msg);
 }
@@ -664,16 +684,24 @@ static void camera_send_image_captured(int32_t index, bool success)
     captured.image_index = index;
     captured.capture_result = success ? 1 : 0;
 
-    mavlink_message_t msg;
-    mavlink_msg_camera_image_captured_encode_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status,
-                                                    &msg, &captured);
-    camera_send(&msg);
+    // to both links, as the photo may have been asked for by either:
+    // the flight controller passes it on to its other links
+    const bool reply_to_fc = camera_reply_to_fc;
+    unsigned i;
+    for (i = 0; i < 2; i++) {
+        camera_reply_to_fc = (i == 1);
+        mavlink_message_t msg;
+        mavlink_msg_camera_image_captured_encode_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(),
+                                                        &msg, &captured);
+        camera_send(&msg);
+    }
+    camera_reply_to_fc = reply_to_fc;
 }
 
 static void camera_send_ack(const mavlink_message_t *request, uint16_t command, uint8_t result)
 {
     mavlink_message_t msg;
-    mavlink_msg_command_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+    mavlink_msg_command_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(), &msg,
                                         command, result,
                                         0, 0, // progress, result_param2
                                         request->sysid, request->compid);
@@ -766,7 +794,7 @@ static void camera_send_param(const struct camera_param *p)
     char value[MAVLINK_MSG_PARAM_EXT_VALUE_FIELD_PARAM_VALUE_LEN];
     camera_param_encode(value, p, camera_param_get(p));
     mavlink_message_t msg;
-    mavlink_msg_param_ext_value_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+    mavlink_msg_param_ext_value_pack_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(), &msg,
                                             p->name, value, p->type,
                                             CAMERA_NUM_PARAMS, p - camera_params);
     camera_send(&msg);
@@ -801,7 +829,7 @@ static void camera_handle_param_set(const mavlink_message_t *msg)
     char value[MAVLINK_MSG_PARAM_EXT_ACK_FIELD_PARAM_VALUE_LEN];
     camera_param_encode(value, p, camera_param_get(p));
     mavlink_message_t ack;
-    mavlink_msg_param_ext_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &ack,
+    mavlink_msg_param_ext_ack_pack_status(fc_sysid, CAMERA_COMPONENT_ID, camera_tx_status(), &ack,
                                           p->name, value, p->type, result);
     camera_send(&ack);
 }
@@ -1073,6 +1101,28 @@ static void camera_handle_command(const mavlink_message_t *msg)
     }
 }
 
+/*
+  a message addressed to the camera; false if it isn't one we handle
+ */
+static bool camera_handle_msg(const mavlink_message_t *msg)
+{
+    switch (msg->msgid) {
+    case MAVLINK_MSG_ID_COMMAND_LONG:
+        camera_handle_command(msg);
+        return true;
+    case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_LIST:
+        camera_handle_param_list(msg);
+        return true;
+    case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_READ:
+        camera_handle_param_read(msg);
+        return true;
+    case MAVLINK_MSG_ID_PARAM_EXT_SET:
+        camera_handle_param_set(msg);
+        return true;
+    }
+    return false;
+}
+
 // is this message addressed to the camera?
 static bool camera_is_target(const mavlink_message_t *msg)
 {
@@ -1093,9 +1143,11 @@ static bool camera_is_target(const mavlink_message_t *msg)
     message, so the header tells us.
 
   - nothing but messages addressed to the camera.  The flight
-    controller has no route to us (we never send it anything), so it
-    would act on them itself: ArduPilot handles a message for its own
-    system ID with an unknown component as if it were addressed to it.
+    controller's only route to us is the link they came in on, and
+    ArduPilot never sends a message back on that link, so it would
+    act on them itself: it handles a message for its own system ID
+    with a component it has no other route to as if it were addressed
+    to it.
  */
 static bool camera_udp_input(const uint8_t *buf, ssize_t len, const struct sockaddr_in *from)
 {
@@ -1138,20 +1190,7 @@ static bool camera_udp_input(const uint8_t *buf, ssize_t len, const struct socka
             continue;
         }
         for_camera = true;
-        switch (msg.msgid) {
-        case MAVLINK_MSG_ID_COMMAND_LONG:
-            camera_handle_command(&msg);
-            break;
-        case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_LIST:
-            camera_handle_param_list(&msg);
-            break;
-        case MAVLINK_MSG_ID_PARAM_EXT_REQUEST_READ:
-            camera_handle_param_read(&msg);
-            break;
-        case MAVLINK_MSG_ID_PARAM_EXT_SET:
-            camera_handle_param_set(&msg);
-            break;
-        }
+        camera_handle_msg(&msg);
     }
     // only whole messages, all for us; anything else goes on as it was
     return for_camera && !for_others && rxstatus.parse_state == MAVLINK_PARSE_STATE_IDLE;
@@ -1183,6 +1222,10 @@ static void camera_periodic(void)
     }
 
     camera_send_heartbeat();
+    // and to the flight controller, so it knows we're on this link
+    camera_reply_to_fc = true;
+    camera_send_heartbeat();
+    camera_reply_to_fc = false;
     camera_send_information();
     camera_send_stream_information();
     // QGC leaves its buttons showing "busy" until it hears this
@@ -1818,6 +1861,26 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
         message_intervals_count(msg->msgid);
     }
     mavlink_periodic();
+
+    if (fc_sysid != 0 && camera_is_target(msg)) {
+        // a command or setting for the camera from the flight
+        // controller (its MAVLinkCamV2 backend), or passed on by it
+        // from another of its links: answered back to it, and not
+        // passed on to WiFi
+        camera_reply_to_fc = true;
+        const bool handled = camera_handle_msg(msg);
+        camera_reply_to_fc = false;
+        if (handled) {
+            return true;
+        }
+    }
+    if (fc_sysid != 0 && msg->sysid == fc_sysid && msg->compid == CAMERA_COMPONENT_ID) {
+        // the flight controller passing on our own camera's messages
+        // (MAVLinkCamV2 answers requests for them with its copies):
+        // WiFi has ours already, and two senders of the same component
+        // with their own sequence numbers would confuse a GCS
+        return true;
+    }
 
     uint32_t now = get_time_boot_ms();
     
