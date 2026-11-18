@@ -52,6 +52,10 @@ static int sitl_sock = -1;
 static char stm32_id[40];
 static bool rc_ok;
 static bool vehicle_armed;
+// a recording going at disarm is due a new file; see check_disarm_new_file()
+static bool disarm_new_file_pending;
+static uint32_t disarmed_ms;
+static unsigned disarm_record_stop_count;  // mf_get_record_stop_count() at disarm
 
 #define QUEUE_SIZE 50*1024
 
@@ -2013,8 +2017,12 @@ static bool mavlink_handle_msg(const mavlink_message_t *msg)
         }
 
         if (!armed && vehicle_armed && schedrec_state() == 1) {
-            console_printf("disarmed: cycling video file\n");
-            rec_sched_next_file();
+            // see check_disarm_new_file()
+            disarm_new_file_pending = true;
+            disarmed_ms = now;
+            disarm_record_stop_count = mf_get_record_stop_count();
+        } else if (armed) {
+            disarm_new_file_pending = false;
         }
         vehicle_armed = armed;
         break;
@@ -2288,6 +2296,37 @@ void telem_main_request_mode(telem_mode_t mode)
 telem_mode_t telem_main_get_mode()
 {
     return telem_mode;
+}
+
+/*
+  a recording going at disarm, and still going a few seconds later,
+  goes on in a new file, so each flight has its own.  The flight
+  controller stops recording on disarming itself if its camera is set
+  up to (CAMn_OPTIONS bit 0); waiting for that means not starting a
+  new file only for it to be stopped at once.  A recording started
+  after disarming isn't split
+ */
+#define DISARM_NEW_FILE_DELAY_MS 3000
+static void check_disarm_new_file(void)
+{
+    if (!disarm_new_file_pending) {
+        return;
+    }
+    if (schedrec_state() != 1 ||
+        mf_get_record_stop_count() != disarm_record_stop_count) {
+        // the recording going at disarm has stopped, even if another
+        // has started since (as the phone app can do between our looks)
+        disarm_new_file_pending = false;
+        return;
+    }
+    if (get_time_boot_ms() - disarmed_ms < DISARM_NEW_FILE_DELAY_MS) {
+        return;
+    }
+    disarm_new_file_pending = false;
+    if (!vehicle_armed) {
+        console_printf("disarmed: cycling video file\n");
+        rec_sched_next_file();
+    }
 }
 
 static void check_video_recording_end()
@@ -2624,6 +2663,7 @@ static void mavlink_main(void *pvParameters, int udp_sock)
 	mavlink_check_baudrate();
 	tx_upload_periodic();
         check_video_recording_end();
+        check_disarm_new_file();
         camera_periodic();
     }
 }
@@ -2853,6 +2893,9 @@ enum FlightCommand {
  */
 bool toggle_recording(void)
 {
+    // whatever was recording at disarm is stopped, or a new
+    // recording started; neither should be split
+    disarm_new_file_pending = false;
     uart_data.is_recording_video = !uart_data.is_recording_video;
     if (!uart_data.is_recording_video) {
         if (get_time_boot_ms() - recording_start_ms > MIN_RECORDING_MS) {
