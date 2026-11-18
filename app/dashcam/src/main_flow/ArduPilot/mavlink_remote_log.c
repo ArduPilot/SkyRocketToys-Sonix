@@ -11,6 +11,7 @@
 #include "dev_console.h"
 
 #include "mavlink_remote_log.h"
+#include "mavlink_ftp.h"
 
 static FIL log_fh;
 static const uint8_t start_interval = 1; // seconds
@@ -179,7 +180,12 @@ static int log_fh_open()
     // never overwrite a log: if LASTLOG.TXT is behind, skip any
     // numbers already in use.  Each try searches the directory, so
     // if a few don't find a free number (LASTLOG.TXT is missing or
-    // well behind), go to the highest number in use
+    // well behind), go to the highest number in use.
+    //
+    // The card lock is held while the log is found a number and
+    // opened, so that FTP can't check a path isn't in use, then have
+    // the log opened there, then change the card there
+    mavlink_ftp_card_lock();
     uint16_t number = read_lastlog_number();
     FRESULT res = FR_EXIST;
     for (uint16_t tries = 0; tries < 1000 && res == FR_EXIST; tries++) {
@@ -198,6 +204,7 @@ static int log_fh_open()
         snprintf(log_filepath, sizeof(log_filepath), REMOTE_LOG_BASEDIR "/%06u.BIN", number);
         res = f_open(&log_fh, log_filepath, FA_CREATE_NEW|FA_WRITE);
     }
+    mavlink_ftp_card_unlock();
     if (res != FR_OK) {
         const long long now = get_sys_seconds_boot();
         if (last_lastlog_logfh_warning == 0 ||
@@ -217,6 +224,10 @@ static int log_fh_open()
  */
 static void log_fh_close()
 {
+    // once the log is closed FTP no longer sees it as in use, so the
+    // card lock is held until a small one has been removed: FTP
+    // can't open it in between and be left writing to a removed file
+    mavlink_ftp_card_lock();
     unsigned int file_size = (unsigned)f_size(&log_fh);
     f_close(&log_fh);
     log_fh.fs = 0; // OS doesn't do this if it fails to close...
@@ -227,6 +238,7 @@ static void log_fh_close()
         console_printf("rl: small log (%u bytes).  Removing.\n", (unsigned)file_size);
         f_unlink(log_filepath);
     }
+    mavlink_ftp_card_unlock();
 }
 
 /*
@@ -237,6 +249,14 @@ static const int log_fh_is_open()
     return (log_fh.fs != 0);
 }
 
+
+/*
+ * the log being written, or NULL if none is
+ */
+const char *mavlink_remote_log_current_file(void)
+{
+    return log_fh_is_open() ? log_filepath : NULL;
+}
 
 /*
  * send an acknowledgement to the server that we have received a block
