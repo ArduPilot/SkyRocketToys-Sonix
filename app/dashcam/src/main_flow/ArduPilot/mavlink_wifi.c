@@ -46,7 +46,10 @@
 
 static xTaskHandle telem_process;
 static uint8_t debug_level;
-static bool mavlink_sitl_input = true; // we will disable this for production
+// a TCP client on port 14550 takes the flight controller's place, for
+// flying SITL with the vehicle's transmitter; the console's "mavsitl 1"
+// turns it on
+static bool mavlink_sitl_input = false;
 static int sitl_listen_sock = -1;
 static int sitl_sock = -1;
 static char stm32_id[40];
