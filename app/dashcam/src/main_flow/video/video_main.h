@@ -188,6 +188,7 @@ void mf_video_uninit(void);
 int mf_set_snapshot(unsigned char ucEnable);
 void mf_set_preview(unsigned char ucEnable);
 void mf_set_record(unsigned char ucEnable);
+unsigned int mf_get_record_stop_count(void);
 void mf_video_get_rec_param(video_param_t *pv_param);
 void mf_video_set_record_cb(h264_notice_t notice_function);
 void mf_video_set_preview_cb(h264_notice_t notice_function);
