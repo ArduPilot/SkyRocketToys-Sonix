@@ -5,6 +5,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 #include <libmid_fatfs/ff.h>
 #include <sys_clock.h>
 #include "dev_console.h"
@@ -71,6 +72,49 @@ static uint16_t read_lastlog_number(void)
 }
 
 /*
+ * the highest log number in use in the log directory, or min if
+ * that is higher.  Reads every directory entry, each a separate
+ * call into FatFs's task, so only for when LASTLOG.TXT is well
+ * behind
+ */
+static uint16_t highest_log_number(uint16_t min)
+{
+    uint16_t highest = min;
+    DIR dir;
+    if (f_opendir(&dir, REMOTE_LOG_BASEDIR) != FR_OK) {
+        return highest;
+    }
+    FILINFO fno;
+    memset(&fno, 0, sizeof(fno));
+    // names are 8.3, so the short name is enough
+    fno.lfname = NULL;
+    fno.lfsize = 0;
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+        if (fno.fattrib & AM_DIR) {
+            continue;
+        }
+        // NNNNNN.BIN
+        const char *name = fno.fname;
+        unsigned number = 0;
+        unsigned i;
+        for (i = 0; i < 6 && name[i] >= '0' && name[i] <= '9'; i++) {
+            number = number * 10 + (name[i] - '0');
+        }
+        // the extension in either case: FatFs gives ".bin" for a
+        // short name that a PC, or FatFs itself, marked lower case
+        const char *ext = &name[6];
+        if (i == 6 && ext[0] == '.' &&
+            (ext[1] & ~0x20) == 'B' && (ext[2] & ~0x20) == 'I' &&
+            (ext[3] & ~0x20) == 'N' && ext[4] == '\0' &&
+            number <= 0xFFFF && number > highest) {
+            highest = number;
+        }
+    }
+    f_closedir(&dir);
+    return highest;
+}
+
+/*
  * record the number of the last log created in LASTLOG.TXT.
  *
  * It is overwritten in place and truncated, not opened with
@@ -88,6 +132,12 @@ static void write_lastlog_number(uint16_t number)
     FRESULT res = f_open(&lastlog_fptr, lastlog_filepath, FA_OPEN_EXISTING|FA_WRITE);
     if (res == FR_NO_FILE) {
         res = f_open(&lastlog_fptr, lastlog_filepath, FA_CREATE_NEW|FA_WRITE);
+    } else if (res == FR_DENIED) {
+        // read-only, perhaps set on a PC; a marker that can't be
+        // updated would leave every new log searching from it
+        if (f_chmod(lastlog_filepath, 0, AM_RDO) == FR_OK) {
+            res = f_open(&lastlog_fptr, lastlog_filepath, FA_OPEN_EXISTING|FA_WRITE);
+        }
     }
     if (res != FR_OK) {
 	// moan about not being able to open the file
@@ -127,10 +177,20 @@ static int log_fh_open()
     ensure_log_basedir_exists();
 
     // never overwrite a log: if LASTLOG.TXT is behind, skip any
-    // numbers already in use
+    // numbers already in use.  Each try searches the directory, so
+    // if a few don't find a free number (LASTLOG.TXT is missing or
+    // well behind), go to the highest number in use
     uint16_t number = read_lastlog_number();
     FRESULT res = FR_EXIST;
     for (uint16_t tries = 0; tries < 1000 && res == FR_EXIST; tries++) {
+        if (tries == 5) {
+            // unless the highest is the last number: going on from
+            // there would wrap back to the numbers already tried
+            const uint16_t highest = highest_log_number(number);
+            if (highest != 0xFFFF) {
+                number = highest;
+            }
+        }
         number++;
         if (number == 0) {
             number = 1;
