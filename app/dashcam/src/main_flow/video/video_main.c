@@ -801,6 +801,8 @@ void mf_set_uvc_view(unsigned char ucEnable)
 
 
 
+static volatile unsigned int record_stop_count;
+
 /**
 * @brief interface function - set record start or stop
 * @param ucEnable 0:preview stop 1:preview start
@@ -810,8 +812,19 @@ void mf_set_record(unsigned char ucEnable)
 	VDO_PRINT(SYS_DBG, "H.264 Record %s\n", ucEnable ? "ON" : "OFF");
 	if (ucEnable)
 		ispch0_info.ucStreamMode |= FMT_H264;
-	else
+	else {
 		ispch0_info.ucStreamMode &= (~FMT_H264);
+		record_stop_count++;
+	}
+}
+
+/**
+* @brief interface function - how many times recording has been turned off
+*  (by mf_set_record), so that a stop followed at once by a start can be seen
+*/
+unsigned int mf_get_record_stop_count(void)
+{
+	return record_stop_count;
 }
 
 /**
