@@ -49,7 +49,7 @@ static uint8_t debug_level;
 // a TCP client on port 14550 takes the flight controller's place, for
 // flying SITL with the vehicle's transmitter; the console's "mavsitl 1"
 // turns it on
-static bool mavlink_sitl_input = false;
+static volatile bool mavlink_sitl_input = false;
 static int sitl_listen_sock = -1;
 static int sitl_sock = -1;
 static char stm32_id[40];
@@ -2475,6 +2475,10 @@ static void start_sitl_sock(void)
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(MAVLINK_LOCAL_PORT);
 
+    // a connection we closed holds the port in TIME_WAIT for minutes
+    int on = 1;
+    setsockopt(sitl_listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+
     if (bind(sitl_listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         goto failed;
     }
@@ -2647,6 +2651,17 @@ static void mavlink_main(void *pvParameters, int udp_sock)
 
         if (mavlink_sitl_input && sitl_listen_sock == -1) {
             start_sitl_sock();
+        }
+        if (!mavlink_sitl_input) {
+            // closed here, as this thread selects on them
+            if (sitl_sock != -1) {
+                close(sitl_sock);
+                sitl_sock = -1;
+            }
+            if (sitl_listen_sock != -1) {
+                close(sitl_listen_sock);
+                sitl_listen_sock = -1;
+            }
         }
 
         /*
@@ -2863,19 +2878,14 @@ void mavlink_set_unicast(bool enable)
     console_printf("mavlink: unicast to GCSes %s\n", enable ? "on" : "off");
 }
 
+/*
+  the MAVLink thread opens and closes the sockets: closing them here,
+  in the console's task, while that thread may be in select() on them,
+  hung the console
+ */
 void mavlink_set_sitl(bool enable)
 {
     mavlink_sitl_input = enable;
-    if (!mavlink_sitl_input) {
-        if (sitl_sock != -1) {
-            close(sitl_sock);
-            sitl_sock = -1;
-        }
-        if (sitl_listen_sock != -1) {
-            close(sitl_listen_sock);
-            sitl_listen_sock = -1;
-        }
-    }
     console_printf("mavlink_sitl=%s\n", enable?"true":"false");
 }
 
