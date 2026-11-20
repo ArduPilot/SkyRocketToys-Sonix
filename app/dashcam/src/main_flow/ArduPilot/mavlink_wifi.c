@@ -23,6 +23,7 @@
 #include "ublox.h"
 #include "mavlink_wifi.h"
 #include "mavlink_remote_log.h"
+#include "mavlink_ftp.h"
 #include "bootloader_client.h"
 #include "tx_upload.h"
 #include <mavlink_core.h>
@@ -1198,10 +1199,33 @@ static bool camera_udp_input(const uint8_t *buf, ssize_t len, const struct socka
             continue;
         }
         for_camera = true;
-        camera_handle_msg(&msg);
+        if (msg.msgid == MAVLINK_MSG_ID_FILE_TRANSFER_PROTOCOL) {
+            // only on WiFi: the replies go to the GCS's own address
+            mavlink_ftp_request(&msg, from);
+        } else {
+            camera_handle_msg(&msg);
+        }
     }
     // only whole messages, all for us; anything else goes on as it was
     return for_camera && !for_others && rxstatus.parse_state == MAVLINK_PARSE_STATE_IDLE;
+}
+
+/*
+  send the FTP task's replies, each only to the GCS that asked.  A
+  few at a time, so a burst read doesn't hold up the UART
+ */
+static void camera_send_ftp_replies(void)
+{
+    struct mavlink_ftp_reply r;
+    unsigned n;
+    for (n = 0; n < 8 && camera_udp_sock != -1 && mavlink_ftp_get_reply(&r); n++) {
+        mavlink_message_t msg;
+        uint8_t buf[300];
+        mavlink_msg_file_transfer_protocol_pack_status(fc_sysid, CAMERA_COMPONENT_ID, &camera_status, &msg,
+                                                       0, r.sysid, r.compid, r.payload);
+        const uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+        sendto_wifi(camera_udp_sock, buf, len, &r.addr);
+    }
 }
 
 static void camera_periodic(void)
@@ -2573,7 +2597,8 @@ static void mavlink_main(void *pvParameters, int udp_sock)
         }
         
         tv.tv_sec = 0;
-        tv.tv_usec = 10000;
+        // come back sooner for the FTP task's replies during a transfer
+        tv.tv_usec = mavlink_ftp_busy() ? 1000 : 10000;
         
         int res = select(numfd, &fds, NULL, NULL, &tv);
         if (res > 0 && FD_ISSET(udp_sock, &fds)) {
@@ -2687,6 +2712,7 @@ static void mavlink_main(void *pvParameters, int udp_sock)
         check_video_recording_end();
         check_disarm_new_file();
         camera_periodic();
+        camera_send_ftp_replies();
     }
 }
 
@@ -2761,6 +2787,7 @@ void mavlink_show_stats(void)
                            msg_interval_pending[i] ? "to send" : "sent");
         }
     }
+    mavlink_ftp_status();
 }
 
 unsigned mavlink_fc_pkt_count(void)
